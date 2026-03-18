@@ -1,7 +1,7 @@
 # Document Intelligence POC: Multi-Agent RAG Reseacher
 
 ## Overview
-Multi-agent Retrieval-Augmented Generation (RAG) POC . It elevates standard PDF parsing by utilizing Document Layout Analysis to preserve complex structures (like tables), employs LangGraph for deterministic agent routing, and integrates LangSmith for full-stack observability and automated evaluation.
+Multi-agent Retrieval-Augmented Generation document intelligence POC . It elevates standard PDF parsing by utilizing Document Layout Analysis to preserve complex structures (like tables and images), employs LangGraph for deterministic agent routing, and integrates LangSmith for full-stack observability and automated evaluation.
 
 ## Key Features
 * **Advanced Document Intelligence:** Uses IBM Docling to bypass standard OCR limitations, explicitly extracting and tagging tables and visual elements as isolated Markdown to prevent Vector Dilution.
