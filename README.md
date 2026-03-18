@@ -31,4 +31,4 @@ LANGCHAIN_TRACING_V2=true
 LANGCHAIN_ENDPOINT=[https://api.smith.langchain.com](https://api.smith.langchain.com)
 LANGCHAIN_API_KEY=your_langsmith_api_key_here
 LANGCHAIN_PROJECT=Doc_Intelligence_POC
-'''
+
