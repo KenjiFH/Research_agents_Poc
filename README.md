@@ -1,0 +1,1 @@
+A RAG Research workflow wrapped in a streamlit UI using multiple agents (researcher, synthesizer, evaluator) and orchestrated with langgraph, it also contains document intelligence features like OCR and table chunking.
