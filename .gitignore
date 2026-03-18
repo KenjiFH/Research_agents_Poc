@@ -42,13 +42,7 @@ chroma/
 *.db
 *.sqlite3
 
-# Uploaded documents and test files
-*.pdf
-*.txt
-*.csv
-data/
-uploads/
-temp/
+
 
 # Streamlit specific
 .streamlit/

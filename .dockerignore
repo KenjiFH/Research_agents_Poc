@@ -1,0 +1,27 @@
+# Credentials
+
+.env
+
+# Virtual Environments
+
+venv/
+.venv/
+env/
+
+# Git history
+
+.git/
+.gitignore
+
+# Python Cache (Prevents weird state bugs)
+
+**pycache**/
+_.pyc
+_.pyo
+\*.pyd
+
+# Vector DB local storage (Chroma usually creates a local folder) - its just in streamlit in local mem but just to be sure
+
+# We want the container to build its own fresh DB, not copy your local one
+
+chroma_db/
