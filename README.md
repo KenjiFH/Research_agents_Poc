@@ -4,7 +4,7 @@
 Multi-agent Retrieval-Augmented Generation document intelligence POC . It elevates standard PDF parsing by utilizing Document Layout Analysis to preserve complex structures (like tables and images), employs LangGraph for deterministic agent routing, and integrates LangSmith for full-stack observability and automated evaluation.
 
 ## Key Features
-* **Advanced Document Intelligence:** Uses IBM Docling to bypass standard OCR limitations, explicitly extracting and tagging tables and visual elements as isolated Markdown to prevent Vector Dilution.
+* **Document Intelligence Features:** Uses IBM Docling to bypass standard OCR limitations, explicitly extracting and tagging tables and visual elements as isolated Markdown to prevent Vector Dilution.
 * **Multi-Agent State Machine:** Replaces unpredictable autonomous agents with a deterministic LangGraph workflow (`Researcher` -> `Synthesizer` -> `Evaluator`).
 * **Automated QA & Evaluation:** Utilizes LangChain's native `CriteriaEvalChain` for Chain-of-Thought (CoT) grading, outputting strict binary scores for *Faithfulness* (hallucination checks) and *Relevance*.
 * **Full-Stack Observability:** Native LangSmith integration traces node execution, token economics, and pushes programmatic feedback scores directly to the cloud dashboard.
