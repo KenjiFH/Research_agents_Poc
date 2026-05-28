@@ -145,13 +145,13 @@ def create_multi_agent_workflow(retriever):
                 ls_client.create_feedback(
                     run_id,
                     key="faithfulness",
-                    score=f_score / 100.0, 
+                    score=f_score, 
                 )
                 # 3. Push Relevance to the dashboard
                 ls_client.create_feedback(
                     run_id,
                     key="relevance",
-                    score=r_score / 100.0,
+                    score=r_score,
                 )
                 print("Successfully pushed QA metrics to LangSmith Dashboard!")
             except Exception as e:
