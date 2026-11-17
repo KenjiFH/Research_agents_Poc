@@ -3,6 +3,8 @@
 ## Overview
 A local, stateless Multi-agent Retrieval-Augmented Generation document intelligence POC . It elevates standard PDF parsing by utilizing Document Layout Analysis to preserve complex structures (like tables and images), employs LangGraph for deterministic agent routing, and integrates LangSmith for full-stack observability and automated evaluation.
 
+the embedding model only ever sees numbers derived from text (or pixels, for multimodal models), and it knows nothing about the source document. Everything else, like linking a chunk to its doc, page, or table, is handled by metadata stored next to the vector. in document processor.py, we used metadata tagging since a PDF is just a layout. The ingestion pipeline first runs a layout parser that splits each page into typed elemennts, OCR reads the text in the image, and that text is embedded.
+
 ## Key Features
 * **Document Intelligence Features:** Uses IBM Docling to bypass standard OCR limitations, explicitly extracting and tagging tables and visual elements as isolated Markdown to prevent Vector Dilution.
 * **Multi-Agent State Machine:** Replaces unpredictable autonomous agents with a deterministic LangGraph workflow (`Researcher` -> `Synthesizer` -> `Evaluator`).
