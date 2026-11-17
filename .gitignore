@@ -65,3 +65,25 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+
+
+
+#Project Specific
+updates.md
+
+#Agents
+.Agents
+# ==========================================
+# Claude Code (Local & Personal Overrides)
+# ==========================================
+.claude/settings.local.json
+CLAUDE.local.md
+.claude/cache/
+.claude/logs/
+
+# ==========================================
+# BMad Method (Local User Data & Temp Files)
+# ==========================================
+_bmad/custom/
+_bmad/**/*.local.*
+skills-lock.json
