@@ -88,3 +88,6 @@ CLAUDE.local.md
 _bmad/custom/
 _bmad/**/*.local.*
 skills-lock.json
+# BMad runtime and output
+_bmad/
+_bmad-output/
