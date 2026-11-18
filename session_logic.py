@@ -38,3 +38,17 @@ def verdict_warning(faithfulness, relevance):
     if relevance == "error":
         return "Relevance could not be checked (the evaluator failed)."
     return None
+
+
+NO_SOURCES_NOTE = "No verified sources for this answer."
+
+
+def citation_title(citation):
+    """Heading for a source card: the page and the chunk it came from."""
+    page = citation.get("page_no")
+    return f"Page {page if page is not None else '?'} · {citation.get('chunk_id', '?')}"
+
+
+def sources_note(citations):
+    """A note for the UI when an answer has no verified citations, else None (AD-5, story 2.3)."""
+    return None if citations else NO_SOURCES_NOTE

@@ -1,6 +1,6 @@
 import unittest
 
-from session_logic import upload_action, verdict_label, verdict_warning
+from session_logic import NO_SOURCES_NOTE, citation_title, sources_note, upload_action, verdict_label, verdict_warning
 
 
 class UploadActionTests(unittest.TestCase):
@@ -46,6 +46,18 @@ class VerdictDisplayTests(unittest.TestCase):
 
     def test_no_warning_when_both_pass(self):
         self.assertIsNone(verdict_warning("pass", "pass"))
+
+
+class SourceCardTests(unittest.TestCase):
+    def test_title_shows_page_and_chunk(self):
+        self.assertEqual(citation_title({"page_no": 4, "chunk_id": "c3", "quote": "q"}), "Page 4 · c3")
+
+    def test_title_survives_a_missing_page(self):
+        self.assertEqual(citation_title({"chunk_id": "c3", "quote": "q"}), "Page ? · c3")
+
+    def test_note_appears_only_when_there_are_no_verified_citations(self):
+        self.assertEqual(sources_note([]), NO_SOURCES_NOTE)
+        self.assertIsNone(sources_note([{"page_no": 1, "chunk_id": "c1", "quote": "q"}]))
 
 
 if __name__ == "__main__":

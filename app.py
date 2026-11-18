@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
-from session_logic import upload_action, verdict_label, verdict_warning
+from session_logic import upload_action, verdict_label, verdict_warning, citation_title, sources_note
 from agents import create_multi_agent_workflow, get_judge_warning, JudgeModelNotFound
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
@@ -104,12 +104,27 @@ def render_metrics(faithfulness, relevance):
         st.warning(warning)
 
 
+def render_sources(citations):
+    """Show each verified citation as a source card: page and chunk, then the verbatim quote."""
+    note = sources_note(citations)
+    if note:
+        st.caption(note)
+        return
+    st.markdown("**Sources**")
+    for citation in citations:
+        with st.container(border=True):
+            st.markdown(f"**{citation_title(citation)}**")
+            st.text(citation["quote"])  # plain text: the quote may contain markdown characters
+
+
 # Main Chat Interface
 st.header("2. Ask the Agents")
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg["role"] == "assistant":
+            render_sources(msg.get("citations", []))
         if msg["role"] == "assistant" and "metrics" in msg:
             render_metrics(msg["metrics"]["faithfulness"], msg["metrics"]["relevance"])
 
@@ -147,11 +162,15 @@ if prompt := st.chat_input("Ask a question about your document..."):
                 faithfulness = final_state["faithfulness"]
                 relevance = final_state["relevance"]
                 
+                citations = final_state.get("citations", [])
+
                 st.markdown(response)
+                render_sources(citations)
                 render_metrics(faithfulness, relevance)
                 
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response,
+            "citations": citations,
             "metrics": {"faithfulness": faithfulness, "relevance": relevance}
         })
