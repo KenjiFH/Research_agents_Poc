@@ -24,11 +24,52 @@ from langchain_core.prompts import ChatPromptTemplate
 # so we have to use this
 from langchain_classic.evaluation import load_evaluator
 
-LLM_MODEL = "llama3"
+# The model that writes the answer. It is a separate setting from JUDGE_MODEL (AD-4); set
+# ANSWER_MODEL in the environment to change it.
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "").strip() or "llama3"
 
 # The judge grades answers and must not be the model that wrote them (AD-4).
 # Override with the JUDGE_MODEL environment variable; pull the model with Ollama first.
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "").strip() or "qwen2.5:14b"
+
+
+# The synthesizer's reply is constrained to this schema, so structure comes from the model server
+# instead of loose JSON mode, and the description asks for a complete-sentence answer.
+SYNTHESIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {
+            "type": "string",
+            "description": "A complete sentence that restates what was asked and gives the specifics, drawn only from the context.",
+        },
+        "citations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"chunk_id": {"type": "string"}, "quote": {"type": "string"}},
+                "required": ["chunk_id", "quote"],
+            },
+        },
+    },
+    "required": ["answer", "citations"],
+}
+
+
+# The synthesizer's instructions. The example is deliberately generic so a small model has nothing
+# domain-specific to echo; citations are required whenever the answer comes from the context.
+SYNTHESIS_PROMPT = (
+    "You are a helpful and precise assistant. Answer the user's question "
+    "based ONLY on the provided context. If the answer is not in the context, "
+    "say you do not know and return no citations.\n\n"
+    "Write the answer as one or two complete sentences that restate what was asked and give "
+    "the specifics, for example 'Yes, the contract can be renewed for up to two further terms.' "
+    "Never answer with a single word.\n"
+    "Each context passage starts with its id in square brackets, like [c3]. Whenever the answer "
+    "comes from the context, cite at least one passage, and cite every passage you used; "
+    "copy each quote verbatim from that passage, never paraphrase it.\n\n"
+    "Context:\n{context}\n\n"
+    "Question: {question}"
+)
 
 
 def _same_model(a, b):
@@ -87,10 +128,10 @@ class JudgeModelNotFound(RuntimeError):
 
 def get_judge_warning():
     """Return a warning when the judge and the answering model are the same, else None."""
-    if _same_model(JUDGE_MODEL, LLM_MODEL):
+    if _same_model(JUDGE_MODEL, ANSWER_MODEL):
         return (
-            f"Judge model and answering model are both '{LLM_MODEL}': "
-            "self-grading is biased. Set JUDGE_MODEL to a different model."
+            f"Judge model and answering model are both '{ANSWER_MODEL}': "
+            "self-grading is biased. Set JUDGE_MODEL or ANSWER_MODEL so they differ."
         )
     return None
 
@@ -222,10 +263,10 @@ class RAGState(TypedDict):
 
 def create_multi_agent_workflow(retriever):
     # We use format="json" for the evaluator to ensure we get a parseable response
-    llm = ChatOllama(model=LLM_MODEL, temperature=0.2)
-    llm_json = ChatOllama(model=LLM_MODEL, temperature=0.0, format="json")
-    # The synthesizer replies in JSON so it can return citations with its answer
-    synth_llm = ChatOllama(model=LLM_MODEL, temperature=0.2, format="json")
+    llm = ChatOllama(model=ANSWER_MODEL, temperature=0.2)
+    llm_json = ChatOllama(model=ANSWER_MODEL, temperature=0.0, format="json")
+    # The synthesizer replies in a schema-constrained structure so it can return citations with its answer
+    synth_llm = ChatOllama(model=ANSWER_MODEL, temperature=0.2, format=SYNTHESIS_SCHEMA)
 
     # ==========================================
     # Agent 1: The Researcher
@@ -241,19 +282,7 @@ def create_multi_agent_workflow(retriever):
     # ==========================================
     def synthesizer_node(state: RAGState):
         print("--- SYNTHESIZER: Drafting Response ---")
-        prompt = ChatPromptTemplate.from_template(
-            "You are a helpful and precise assistant. Answer the user's question "
-            "based ONLY on the provided context. If the answer is not in the context, "
-            "state that you do not know and return no citations.\n\n"
-            "Each context passage starts with its id in square brackets, like [c3].\n"
-            "Reply with JSON only, in exactly this shape:\n"
-            '{{"answer": "<your answer>", "citations": '
-            '[{{"chunk_id": "<id of a passage you used>", "quote": "<words copied exactly from that passage>"}}]}}\n'
-            "Copy each quote verbatim from the passage; never paraphrase it.\n\n"
-            "Context:\n{context}\n\n"
-            "Question: {question}\n\n"
-            "JSON:"
-        )
+        prompt = ChatPromptTemplate.from_template(SYNTHESIS_PROMPT)
         chain = prompt | synth_llm
         response = chain.invoke({"context": state["context"], "question": state["question"]})
         retrieved = state.get("retrieved_chunks", [])

@@ -35,7 +35,7 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(chat.call_args.kwargs["model"], agents.JUDGE_MODEL)
 
     def test_warning_only_when_judge_equals_answerer(self):
-        with mock.patch.object(agents, "JUDGE_MODEL", agents.LLM_MODEL):
+        with mock.patch.object(agents, "JUDGE_MODEL", agents.ANSWER_MODEL):
             self.assertIn("self-grading", agents.get_judge_warning())
         with mock.patch.object(agents, "JUDGE_MODEL", "some-other-model"):
             self.assertIsNone(agents.get_judge_warning())
@@ -59,7 +59,7 @@ class JudgeTests(unittest.TestCase):
                 self.assertIsNotNone(agents.get_judge_warning(), variant)
 
     def test_judge_and_answer_models_differ_by_default(self):
-        self.assertNotEqual(agents.JUDGE_MODEL, agents.LLM_MODEL)
+        self.assertNotEqual(agents.JUDGE_MODEL, agents.ANSWER_MODEL)
 
 
 if __name__ == "__main__":
