@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
-from session_logic import upload_action, verdict_label, verdict_warning, citation_title, sources_note, ABSTAINED_WARNING
+from session_logic import upload_action, verdict_label, verdict_warning, citation_title, sources_note, ABSTAINED_WARNING, chunk_heading, chunk_preview
 from agents import create_multi_agent_workflow, get_judge_warning, JudgeModelNotFound
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
@@ -118,6 +118,16 @@ def render_sources(citations):
             st.text(citation["quote"])  # plain text: the quote may contain markdown characters
 
 
+def render_retrieved(chunks):
+    """List the chunks retrieved for an answer, in order, so a missed answer can be diagnosed."""
+    with st.expander(f"🔎 Retrieved chunks ({len(chunks)})"):
+        if not chunks:
+            st.caption("Nothing was retrieved for this question.")
+        for rank, chunk in enumerate(chunks, start=1):
+            st.markdown(f"**{chunk_heading(chunk, rank)}**")
+            st.text(chunk_preview(chunk))
+
+
 # Main Chat Interface
 st.header("2. Ask the Agents")
 
@@ -128,6 +138,8 @@ for msg in st.session_state.messages:
             render_sources(msg.get("citations", []))
         if msg["role"] == "assistant" and "metrics" in msg:
             render_metrics(msg["metrics"]["faithfulness"], msg["metrics"]["relevance"], msg.get("abstained", False))
+        if msg["role"] == "assistant" and "retrieved" in msg:
+            render_retrieved(msg["retrieved"])
 
 if prompt := st.chat_input("Ask a question about your document..."):
     if st.session_state.workflow is None:
@@ -172,11 +184,14 @@ if prompt := st.chat_input("Ask a question about your document..."):
                 if not abstained:
                     render_sources(citations)
                 render_metrics(faithfulness, relevance, abstained)
+                retrieved = final_state.get("retrieved_chunks", [])
+                render_retrieved(retrieved)
                 
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response,
             "citations": citations,
             "abstained": abstained,
+            "retrieved": retrieved,
             "metrics": {"faithfulness": faithfulness, "relevance": relevance}
         })

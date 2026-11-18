@@ -28,7 +28,8 @@ def ask(result):
     return at
 
 
-BASE = {"answer": "Blue.", "faithfulness": "pass", "relevance": "pass"}
+CHUNKS = [{"chunk_id": "c1", "page_no": 4, "type": "text", "content": "The sky is blue."}]
+BASE = {"answer": "Blue.", "faithfulness": "pass", "relevance": "pass", "retrieved_chunks": CHUNKS}
 
 
 class AppRenderTests(unittest.TestCase):
@@ -36,7 +37,7 @@ class AppRenderTests(unittest.TestCase):
         at = ask({**BASE, "citations": [{"chunk_id": "c1", "page_no": 4, "quote": "The sky is *blue*."}]})
         self.assertEqual(len(at.exception), 0)
         self.assertIn("**Page 4 · c1**", [m.value for m in at.markdown])
-        self.assertEqual([t.value for t in at.text], ["The sky is *blue*."])
+        self.assertIn("The sky is *blue*.", [t.value for t in at.text])  # shown as plain text, not rendered markdown
 
     def test_no_citations_shows_the_no_verified_sources_note(self):
         at = ask({**BASE, "citations": []})
@@ -50,7 +51,7 @@ class AppRenderTests(unittest.TestCase):
 
     def test_an_abstained_answer_shows_its_own_warning_and_no_sources_note(self):
         at = ask({"answer": "I can't verify an answer to this question from the document.", "citations": [],
-                  "faithfulness": "fail", "relevance": "", "abstained": True})
+                  "faithfulness": "fail", "relevance": "", "abstained": True, "retrieved_chunks": CHUNKS})
         self.assertEqual(len(at.exception), 0)
         self.assertEqual([c.value for c in at.caption], [])
         self.assertEqual([w.value for w in at.warning], [session_logic.ABSTAINED_WARNING])
@@ -58,11 +59,34 @@ class AppRenderTests(unittest.TestCase):
 
     def test_an_abstained_answer_keeps_its_warning_and_no_note_after_a_rerun(self):
         at = ask({"answer": "I can't verify an answer to this question from the document.", "citations": [],
-                  "faithfulness": "fail", "relevance": "", "abstained": True})
+                  "faithfulness": "fail", "relevance": "", "abstained": True, "retrieved_chunks": CHUNKS})
         with mock.patch.object(session_logic, "upload_action", return_value="none"):
             at.run()
         self.assertEqual([c.value for c in at.caption], [])
         self.assertEqual([w.value for w in at.warning], [session_logic.ABSTAINED_WARNING])
+
+    def test_the_retrieved_chunks_panel_lists_chunks_in_order_and_survives_a_rerun(self):
+        chunks = [
+            {"chunk_id": "c4", "page_no": 2, "type": "text", "content": "First retrieved passage."},
+            {"chunk_id": "c9", "page_no": 5, "type": "table", "content": "Second retrieved passage."},
+        ]
+        at = ask({**BASE, "citations": [], "retrieved_chunks": chunks})
+        with mock.patch.object(session_logic, "upload_action", return_value="none"):
+            at.run()
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual([e.label for e in at.expander], ["🔎 Retrieved chunks (2)"])
+        md = [m.value for m in at.markdown]
+        self.assertLess(md.index("**#1 · c4 · page 2 · text**"), md.index("**#2 · c9 · page 5 · table**"))
+        self.assertIn("First retrieved passage.", [t.value for t in at.text])
+
+    def test_an_abstained_answer_still_shows_the_retrieved_chunks_panel(self):
+        at = ask({"answer": "I can't verify an answer to this question from the document.", "citations": [],
+                  "faithfulness": "fail", "relevance": "", "abstained": True, "retrieved_chunks": CHUNKS})
+        self.assertEqual([e.label for e in at.expander], ["🔎 Retrieved chunks (1)"])
+
+    def test_an_empty_retrieval_says_so(self):
+        at = ask({**BASE, "citations": [], "retrieved_chunks": []})
+        self.assertIn("Nothing was retrieved for this question.", [c.value for c in at.caption])
 
     def test_citations_survive_a_rerun_in_the_history(self):
         at = ask({**BASE, "citations": [{"chunk_id": "c2", "page_no": 7, "quote": "Grass is green."}]})

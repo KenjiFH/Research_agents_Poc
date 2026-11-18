@@ -55,3 +55,18 @@ def sources_note(citations):
 
 
 ABSTAINED_WARNING = "The answer could not be verified against the document, so it was withheld."
+
+
+PREVIEW_CHARS = 300
+
+
+def chunk_heading(chunk, rank):
+    """Heading for one retrieved chunk in the panel: its rank, id, page and type."""
+    page = chunk.get("page_no")
+    return f"#{rank} · {chunk.get('chunk_id', '?')} · page {page if page is not None else '?'} · {chunk.get('type') or '?'}"
+
+
+def chunk_preview(chunk, limit=PREVIEW_CHARS):
+    """The start of a chunk's text, whitespace squashed, cut with an ellipsis when long."""
+    text = " ".join(str(chunk.get("content", "")).split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"

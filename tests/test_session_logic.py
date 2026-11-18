@@ -1,6 +1,6 @@
 import unittest
 
-from session_logic import NO_SOURCES_NOTE, citation_title, sources_note, upload_action, verdict_label, verdict_warning
+from session_logic import NO_SOURCES_NOTE, chunk_heading, chunk_preview, citation_title, sources_note, upload_action, verdict_label, verdict_warning
 
 
 class UploadActionTests(unittest.TestCase):
@@ -58,6 +58,21 @@ class SourceCardTests(unittest.TestCase):
     def test_note_appears_only_when_there_are_no_verified_citations(self):
         self.assertEqual(sources_note([]), NO_SOURCES_NOTE)
         self.assertIsNone(sources_note([{"page_no": 1, "chunk_id": "c1", "quote": "q"}]))
+
+
+class RetrievedPanelTests(unittest.TestCase):
+    def test_heading_shows_rank_id_page_and_type(self):
+        chunk = {"chunk_id": "c9", "page_no": 3, "type": "table", "content": "x"}
+        self.assertEqual(chunk_heading(chunk, 2), "#2 · c9 · page 3 · table")
+
+    def test_heading_survives_missing_fields(self):
+        self.assertEqual(chunk_heading({}, 1), "#1 · ? · page ? · ?")
+
+    def test_preview_squashes_whitespace_and_cuts_long_text(self):
+        self.assertEqual(chunk_preview({"content": "a\n\n  b"}), "a b")
+        long = chunk_preview({"content": "word " * 200}, limit=20)
+        self.assertTrue(long.endswith("…"))
+        self.assertLessEqual(len(long), 21)
 
 
 if __name__ == "__main__":

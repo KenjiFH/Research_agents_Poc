@@ -18,7 +18,7 @@ class FormatContextTests(unittest.TestCase):
         context, retrieved = agents.format_context([doc("c3", 2, "Alpha text."), doc("c7", 5, "Beta text.")])
         self.assertIn("[c3] (page 2)\nAlpha text.", context)
         self.assertIn("[c7] (page 5)\nBeta text.", context)
-        self.assertEqual(retrieved[1], {"chunk_id": "c7", "page_no": 5, "content": "Beta text."})
+        self.assertEqual(retrieved[1], {"chunk_id": "c7", "page_no": 5, "type": "text", "content": "Beta text."})
 
     def test_falls_back_to_position_when_a_chunk_has_no_id(self):
         _, retrieved = agents.format_context([Document(page_content="x", metadata={})])

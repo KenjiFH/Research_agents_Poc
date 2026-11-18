@@ -143,7 +143,7 @@ def format_context(docs):
     """Number retrieved chunks by chunk_id so the synthesizer can cite them (AD-5).
 
     Returns (context_text, retrieved_chunks) where retrieved_chunks is a list of
-    {"chunk_id", "page_no", "content"} used later to resolve and verify citations.
+    {"chunk_id", "page_no", "type", "content"} used later to resolve and verify citations.
     """
     retrieved = []
     blocks = []
@@ -151,7 +151,9 @@ def format_context(docs):
         # Fallback ids use an "r" prefix so they can never collide with real "c<n>" ids
         chunk_id = doc.metadata.get("chunk_id") or f"r{position}"
         page_no = doc.metadata.get("page_no")
-        retrieved.append({"chunk_id": chunk_id, "page_no": page_no, "content": doc.page_content})
+        retrieved.append({
+            "chunk_id": chunk_id, "page_no": page_no, "type": doc.metadata.get("type"), "content": doc.page_content,
+        })
         page_label = f" (page {page_no})" if page_no is not None else ""
         blocks.append(f"[{chunk_id}]{page_label}\n{doc.page_content}")
     return "\n\n---\n\n".join(blocks), retrieved
@@ -209,7 +211,7 @@ def parse_synthesis(raw_text, retrieved_chunks):
 class RAGState(TypedDict):
     question: str
     context: str
-    retrieved_chunks: list   # [{chunk_id, page_no, content}] behind the numbered context
+    retrieved_chunks: list   # [{chunk_id, page_no, type, content}] behind the numbered context
     answer: str
     citations: list          # [{chunk_id, page_no, quote}]
     faithfulness: str        # "pass" | "fail" | "error": did it use only the context?
