@@ -62,6 +62,33 @@ class ParseSynthesisTests(unittest.TestCase):
             self.assertEqual(agents.parse_synthesis(raw, self.RETRIEVED), ("I do not know.", []))
 
 
+class VerifyCitationsTests(unittest.TestCase):
+    RETRIEVED = [{"chunk_id": "c1", "page_no": 4, "content": "The sky is\nblue on clear days."}]
+
+    def cite(self, quote, chunk_id="c1"):
+        return {"chunk_id": chunk_id, "page_no": 4, "quote": quote}
+
+    def test_verbatim_quote_stays(self):
+        self.assertEqual(agents.verify_citations([self.cite("blue on clear days")], self.RETRIEVED),
+                         [self.cite("blue on clear days")])
+
+    def test_quote_across_a_line_break_still_verifies(self):
+        self.assertEqual(len(agents.verify_citations([self.cite("The sky is blue")], self.RETRIEVED)), 1)
+
+    def test_altered_quote_is_dropped(self):
+        self.assertEqual(agents.verify_citations([self.cite("The sky is green")], self.RETRIEVED), [])
+
+    def test_case_change_is_dropped(self):
+        self.assertEqual(agents.verify_citations([self.cite("the sky is blue")], self.RETRIEVED), [])
+
+    def test_quote_from_a_different_chunk_is_dropped(self):
+        retrieved = self.RETRIEVED + [{"chunk_id": "c2", "page_no": 5, "content": "Grass is green."}]
+        self.assertEqual(agents.verify_citations([self.cite("Grass is green.", "c1")], retrieved), [])
+
+    def test_unknown_chunk_and_empty_quote_are_dropped(self):
+        self.assertEqual(agents.verify_citations([self.cite("x", "c9"), self.cite("  ")], self.RETRIEVED), [])
+
+
 class GraphTests(unittest.TestCase):
     """The whole graph with the LLMs, the judge and LangSmith replaced."""
 
@@ -92,6 +119,14 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(args[0], "What colour is the sky?")
         self.assertEqual(args[1], "Blue.")
         self.assertIn("[c1] (page 4)", args[2])
+
+    def test_an_altered_quote_is_removed_from_the_final_state(self):
+        reply = json.dumps({"answer": "Blue.", "citations": [
+            {"chunk_id": "c1", "quote": "The sky is blue."}, {"chunk_id": "c1", "quote": "The sky is purple."},
+        ]})
+        scores = {"faithfulness_score": 100, "relevance_score": 100, "faithfulness_reasoning": "", "relevance_reasoning": ""}
+        state, _ = self._run(reply, scores)
+        self.assertEqual([c["quote"] for c in state["citations"]], ["The sky is blue."])
 
     def test_a_missing_score_still_becomes_zero_until_story_4_1(self):
         reply = json.dumps({"answer": "Blue.", "citations": []})

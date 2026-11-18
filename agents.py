@@ -118,6 +118,25 @@ def format_context(docs):
     return "\n\n---\n\n".join(blocks), retrieved
 
 
+def _squash_whitespace(text):
+    return " ".join(str(text).split())
+
+
+def verify_citations(citations, retrieved_chunks):
+    """Keep only citations whose quote is a verbatim substring of the chunk they name (AD-5).
+
+    Whitespace runs (line breaks, repeated spaces) are treated as one space on both sides, so a
+    quote copied across a line break still verifies; words and case must match exactly.
+    """
+    content = {chunk["chunk_id"]: _squash_whitespace(chunk["content"]) for chunk in retrieved_chunks}
+    verified = []
+    for citation in citations:
+        quote = _squash_whitespace(citation.get("quote", ""))
+        if quote and quote in content.get(citation.get("chunk_id"), ""):
+            verified.append(citation)
+    return verified
+
+
 def parse_synthesis(raw_text, retrieved_chunks):
     """Split the synthesizer's JSON reply into (answer, citations).
 
@@ -193,8 +212,9 @@ def create_multi_agent_workflow(retriever):
         )
         chain = prompt | synth_llm
         response = chain.invoke({"context": state["context"], "question": state["question"]})
-        answer, citations = parse_synthesis(response.content, state.get("retrieved_chunks", []))
-        return {"answer": answer, "citations": citations}
+        retrieved = state.get("retrieved_chunks", [])
+        answer, citations = parse_synthesis(response.content, retrieved)
+        return {"answer": answer, "citations": verify_citations(citations, retrieved)}
 
     # ==========================================
     # Agent 3: The Evaluator (NEW)
