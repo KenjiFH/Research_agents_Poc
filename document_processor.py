@@ -13,10 +13,14 @@ from pydantic import ConfigDict
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from rank_bm25 import BM25Okapi
+import dev_insight
 from langchain_ollama import OllamaEmbeddings
 
 # Using our local Ollama embedding model
 EMBEDDING_MODEL = "nomic-embed-text"
+CHUNK_SIZE = 1000      # characters per text chunk
+CHUNK_OVERLAP = 200
+
 # Retrieval (AD-9): draw many candidates, drop near-duplicates, hand the best few to the answerer
 CANDIDATE_K = 20       # candidates drawn from each search before filtering
 FINAL_K = 6            # chunks the answerer receives
@@ -97,24 +101,35 @@ def _shingles(text, size=4):
     return {" ".join(words[i:i + size]) for i in range(len(words) - size + 1)}
 
 
-def remove_near_duplicates(docs, threshold=DEDUP_THRESHOLD):
-    """Drop a chunk that mostly repeats an earlier, better-ranked one (overlap, boilerplate, repeats).
+def explain_near_duplicates(docs, threshold=DEDUP_THRESHOLD):
+    """Split docs into (kept, dropped); each dropped entry says which kept chunk it repeats and by how much.
 
     A chunk is dropped when at least `threshold` of its own word shingles already appear in one
     kept chunk. A longer chunk that merely contains an earlier short one (a repeated header, say)
     stays, because most of its text is new. The first chunk always stays, and so does a chunk with
     no words, since there is nothing to compare.
     """
-    kept, kept_shingles = [], []
+    kept, kept_shingles, dropped = [], [], []
     for doc in docs:
         shingles = _shingles(doc.page_content)
-        duplicate = bool(shingles) and any(
-            len(shingles & other) / len(shingles) >= threshold for other in kept_shingles
-        )
-        if not duplicate:
+        duplicate_of, containment = None, 0.0
+        if shingles:
+            for other_doc, other in zip(kept, kept_shingles):
+                share = len(shingles & other) / len(shingles)
+                if share >= threshold:
+                    duplicate_of, containment = other_doc.metadata.get("chunk_id"), share
+                    break
+        if duplicate_of is None:
             kept.append(doc)
             kept_shingles.append(shingles)
-    return kept
+        else:
+            dropped.append({"doc": doc, "duplicate_of": duplicate_of, "containment": containment})
+    return kept, dropped
+
+
+def remove_near_duplicates(docs, threshold=DEDUP_THRESHOLD):
+    """Drop a chunk that mostly repeats an earlier, better-ranked one (overlap, boilerplate, repeats)."""
+    return explain_near_duplicates(docs, threshold)[0]
 
 
 COMPOUND = re.compile(r"\w+(?:[.,\-/]\w+)+")
@@ -158,18 +173,55 @@ class KeywordIndex:
         return [self.chunks[i] for i in ranked if tokens & self.token_sets[i]][:k]
 
 
-def reciprocal_rank_fusion(rankings, k=RRF_K):
-    """Merge ranked lists of chunks: each list adds 1 / (k + rank) to a chunk's score.
+def _explain(self, question, k=10):
+    """Why BM25 ranked chunks the way it did, as data for dev_insight.print_bm25_report.
 
-    Chunks are identified by chunk_id; ties keep the order of the earlier list.
+    Returns the query terms (how many chunks contain each, and its idf weight) and the top chunks with
+    each term's share of their score. The per-term shares add up to the BM25 score.
     """
-    scores, first = {}, {}
-    for ranking in rankings:
+    terms = list(dict.fromkeys(tokenize(question)))
+    bm25 = self.bm25
+    info = [{"term": term,
+             "chunks_with_term": sum(1 for tokens in self.token_sets if term in tokens),
+             "idf": (bm25.idf.get(term) or 0.0) if bm25 else 0.0} for term in terms]
+    results = []
+    matches = self.search(question, k=len(self.chunks) or 1)
+    for doc in matches[:k]:
+        i = self.chunks.index(doc)
+        length_norm = 1 - bm25.b + bm25.b * bm25.doc_len[i] / bm25.avgdl
+        shares = []
+        for term in terms:
+            freq = bm25.doc_freqs[i].get(term, 0)
+            weight = (bm25.idf.get(term) or 0.0) * (freq * (bm25.k1 + 1) / (freq + bm25.k1 * length_norm))
+            shares.append((term, weight))
+        results.append({"doc": doc, "score": sum(score for _, score in shares), "term_scores": shares})
+    return {"terms": info, "results": results, "matches": len(matches), "corpus_size": len(self.chunks)}
+
+
+KeywordIndex.explain = _explain
+
+
+def fusion_details(rankings, k=RRF_K):
+    """Merge ranked lists of chunks and keep the working: each entry has the chunk, its fused score, and
+    its 1-based rank in every list (0 when absent).
+
+    Each list adds 1 / (k + rank) to a chunk's score. Chunks are identified by chunk_id; ties keep the
+    order of the earlier list.
+    """
+    scores, first, ranks = {}, {}, {}
+    for position, ranking in enumerate(rankings):
         for rank, doc in enumerate(ranking, start=1):
             key = doc.metadata.get("chunk_id") or doc.page_content
             scores[key] = scores.get(key, 0) + 1 / (k + rank)
             first.setdefault(key, doc)
-    return [first[key] for key in sorted(scores, key=lambda key: -scores[key])]
+            ranks.setdefault(key, [0] * len(rankings))[position] = rank
+    return [{"doc": first[key], "score": scores[key], "ranks": ranks[key]}
+            for key in sorted(scores, key=lambda key: -scores[key])]
+
+
+def reciprocal_rank_fusion(rankings, k=RRF_K):
+    """Merge ranked lists of chunks by reciprocal rank (see fusion_details); returns the chunks in order."""
+    return [entry["doc"] for entry in fusion_details(rankings, k)]
 
 
 _MODEL_CACHE = {}
@@ -197,6 +249,7 @@ class CrossEncoderReranker:
         self.model_name = model_name or RERANKER_MODEL
         self._scorer = scorer
         self._failed = False
+        self.last_scores = {}  # chunk_id -> score from the latest call, for dev_insight
 
     @property
     def unavailable(self):
@@ -225,6 +278,7 @@ class CrossEncoderReranker:
         except Exception as error:
             print(f"Reranking failed for this question ({error}); keeping the earlier order.")
             return docs
+        self.last_scores = {doc.metadata.get("chunk_id"): score for doc, score in zip(docs, scores)}
         order = sorted(range(len(docs)), key=lambda i: -scores[i])
         return [docs[i] for i in order]
 
@@ -243,14 +297,15 @@ class ComposedRetriever(BaseRetriever):
     semantic_search: Callable[[str], list]
     keyword_search: Optional[Callable[[str], list]] = None
     reranker: Optional[Callable[[str, list], list]] = None
+    explain_keyword: Optional[Callable[[str], dict]] = None
     final_k: int = FINAL_K
     dedup_threshold: float = DEDUP_THRESHOLD
 
     def __init__(self, semantic_search, keyword_search=None, reranker=None,
-                 final_k=FINAL_K, dedup_threshold=DEDUP_THRESHOLD):
+                 final_k=FINAL_K, dedup_threshold=DEDUP_THRESHOLD, explain_keyword=None):
         super().__init__(
             semantic_search=semantic_search, keyword_search=keyword_search, reranker=reranker,
-            final_k=final_k, dedup_threshold=dedup_threshold,
+            final_k=final_k, dedup_threshold=dedup_threshold, explain_keyword=explain_keyword,
         )
 
     def candidates(self, question):
@@ -259,11 +314,38 @@ class ComposedRetriever(BaseRetriever):
             return semantic
         return reciprocal_rank_fusion([semantic, list(self.keyword_search(question))])
 
-    def _get_relevant_documents(self, query, *, run_manager=None):
-        candidates = remove_near_duplicates(self.candidates(query), self.dedup_threshold)
+    def stages(self, question):
+        """Run the pipeline and keep every intermediate result, for dev_insight and tests.
+
+        Returns semantic, keyword (None when off), fused (with scores and per-list ranks), deduped,
+        dropped (with what each repeats), reranked (None when off), rerank_scores, keyword_explanation
+        and final: the chunks the answerer receives, identical to what `invoke` returns.
+        """
+        semantic = list(self.semantic_search(question))
+        keyword = None if self.keyword_search is None else list(self.keyword_search(question))
+        if keyword is None:
+            fused = [{"doc": doc, "score": 0.0, "ranks": [rank, 0]} for rank, doc in enumerate(semantic, start=1)]
+        else:
+            fused = fusion_details([semantic, keyword])
+        deduped, dropped = explain_near_duplicates([entry["doc"] for entry in fused], self.dedup_threshold)
+        reranked, scores = None, {}
+        ordered = deduped
         if self.reranker is not None:
-            candidates = self.reranker(query, candidates)
-        return candidates[: self.final_k]
+            reranked = list(self.reranker(question, deduped))
+            scores = dict(getattr(self.reranker, "last_scores", {}) or {})
+            ordered = reranked
+        return {
+            "semantic": semantic, "keyword": keyword, "fused": fused, "deduped": deduped, "dropped": dropped,
+            "reranked": reranked, "rerank_scores": scores,
+            "keyword_explanation": self.explain_keyword(question) if self.explain_keyword and keyword is not None else None,
+            "final": ordered[: self.final_k],
+        }
+
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        stages = self.stages(query)
+        if dev_insight.debug_enabled():
+            dev_insight.print_retrieval_trace(query, stages, final_k=self.final_k)
+        return stages["final"]
 
 
 def make_retriever(vector_store, chunks=None, reranker=None):
@@ -271,11 +353,12 @@ def make_retriever(vector_store, chunks=None, reranker=None):
 
     With chunks it also searches them by keyword; with a reranker it re-orders the candidates.
     """
-    keyword_search = KeywordIndex(chunks).search if chunks else None
+    index = KeywordIndex(chunks) if chunks else None
     return ComposedRetriever(
         lambda question: vector_store.similarity_search(question, k=CANDIDATE_K),
-        keyword_search=keyword_search,
+        keyword_search=index.search if index else None,
         reranker=reranker,
+        explain_keyword=index.explain if index else None,
     )
 
 
@@ -473,8 +556,8 @@ def process_document_and_create_vdb(uploaded_file):
 
         # 5. Selective chunking
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
+            chunk_size=CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP
         )
 
         final_chunks = []
@@ -490,6 +573,9 @@ def process_document_and_create_vdb(uploaded_file):
         tag_chunks(final_chunks)
 
         print(f"Pipeline yielded {len(final_chunks)} context-aware chunks.")
+        if dev_insight.debug_enabled():
+            dev_insight.print_chunking_report(
+                raw_documents, final_chunks, chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
 
         # 6. Embed and store in ChromaDB
         embeddings = OllamaEmbeddings(

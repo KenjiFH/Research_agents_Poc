@@ -10,6 +10,7 @@ import json
 import os
 import warnings
 import ollama
+import dev_insight
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
@@ -275,6 +276,8 @@ def create_multi_agent_workflow(retriever):
         print("--- RESEARCHER: Searching Vector DB ---")
         docs = retriever.invoke(state["question"])
         formatted_context, retrieved_chunks = format_context(docs)
+        if dev_insight.debug_enabled():
+            dev_insight.print_context_report(formatted_context, retrieved_chunks)
         return {"context": formatted_context, "retrieved_chunks": retrieved_chunks}
 
     # ==========================================
