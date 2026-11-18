@@ -17,3 +17,24 @@ def upload_action(uploaded_file_id, current_file_id, has_workflow, has_store):
     if has_workflow or has_store:
         return "reset"
     return "none"
+
+
+VERDICT_LABELS = {"pass": "✅ Pass", "fail": "❌ Fail", "error": "⚠️ Error"}
+
+
+def verdict_label(verdict):
+    """Display text for a verdict; anything unknown shows as not graded."""
+    return VERDICT_LABELS.get(verdict, "– Not graded")
+
+
+def verdict_warning(faithfulness, relevance):
+    """A warning for the user when the answer failed a check or could not be graded, else None."""
+    if faithfulness == "fail":
+        return "This answer may not be supported by the document (faithfulness check failed)."
+    if faithfulness == "error":
+        return "This answer could not be checked against the document (the evaluator failed)."
+    if relevance == "fail":
+        return "This answer may not address your question (relevance check failed)."
+    if relevance == "error":
+        return "Relevance could not be checked (the evaluator failed)."
+    return None

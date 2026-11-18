@@ -1,11 +1,12 @@
 import os
+import uuid
 from dotenv import load_dotenv
 
 # Load the LangSmith keys before the agents boot up
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
-from session_logic import upload_action
+from session_logic import upload_action, verdict_label, verdict_warning
 from agents import create_multi_agent_workflow, get_judge_warning, JudgeModelNotFound
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
@@ -93,6 +94,16 @@ with st.sidebar:
         reset_session()
         st.rerun()
 
+def render_metrics(faithfulness, relevance):
+    """Show each check as Pass / Fail / Error, with a warning when the answer should not be trusted."""
+    col1, col2 = st.columns(2)
+    col1.metric("🔍 Faithfulness (Hallucination Check)", verdict_label(faithfulness))
+    col2.metric("🎯 Relevance (Accuracy Check)", verdict_label(relevance))
+    warning = verdict_warning(faithfulness, relevance)
+    if warning:
+        st.warning(warning)
+
+
 # Main Chat Interface
 st.header("2. Ask the Agents")
 
@@ -100,9 +111,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant" and "metrics" in msg:
-            col1, col2 = st.columns(2)
-            col1.metric("🔍 Faithfulness", f"{msg['metrics']['faithfulness']}%")
-            col2.metric("🎯 Relevance", f"{msg['metrics']['relevance']}%")
+            render_metrics(msg["metrics"]["faithfulness"], msg["metrics"]["relevance"])
 
 if prompt := st.chat_input("Ask a question about your document..."):
     if st.session_state.workflow is None:
@@ -120,27 +129,29 @@ if prompt := st.chat_input("Ask a question about your document..."):
                     "retrieved_chunks": [],
                     "answer": "", 
                     "citations": [],
-                    "faithfulness_score": 0, 
-                    "relevance_score": 0
+                    "faithfulness": "", 
+                    "relevance": ""
                 }
                 
                 try:
-                    final_state = st.session_state.workflow.invoke(initial_state)
+                    run_id = uuid.uuid4()  # lets the evaluator attach feedback to this trace
+                    final_state = st.session_state.workflow.invoke(
+                        initial_state,
+                        config={"run_id": run_id, "configurable": {"ls_run_id": str(run_id)}},
+                    )
                 except JudgeModelNotFound as error:
                     st.error(str(error))
                     st.stop()
                 
                 response = final_state["answer"]
-                f_score = final_state["faithfulness_score"]
-                r_score = final_state["relevance_score"]
+                faithfulness = final_state["faithfulness"]
+                relevance = final_state["relevance"]
                 
                 st.markdown(response)
-                col1, col2 = st.columns(2)
-                col1.metric("🔍 Faithfulness (Hallucination Check)", f"{f_score}%")
-                col2.metric("🎯 Relevance (Accuracy Check)", f"{r_score}%")
+                render_metrics(faithfulness, relevance)
                 
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response,
-            "metrics": {"faithfulness": f_score, "relevance": r_score}
+            "metrics": {"faithfulness": faithfulness, "relevance": relevance}
         })

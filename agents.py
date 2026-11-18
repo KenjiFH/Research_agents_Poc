@@ -39,6 +39,28 @@ def _same_model(a, b):
     return normalize(a) == normalize(b)
 
 
+def verdict_from_score(raw):
+    """Map an evaluator's raw score to a verdict: 1 -> pass, 0 -> fail, anything else -> error (AD-3)."""
+    if raw == 1:
+        return "pass"
+    if raw == 0:
+        return "fail"
+    return "error"
+
+
+def tracing_enabled():
+    """True when LangSmith tracing is switched on in the environment (as the README's .env does)."""
+    for name in ("LANGCHAIN_TRACING_V2", "LANGSMITH_TRACING"):
+        if os.getenv(name, "").strip().lower() in ("true", "1", "yes"):
+            return True
+    return False
+
+
+def verdict_to_score(verdict):
+    """LangSmith feedback score for a verdict: pass 1, fail 0, error None (nothing is sent)."""
+    return {"pass": 1, "fail": 0}.get(verdict)
+
+
 class JudgeModelNotFound(RuntimeError):
     """The configured judge model is not available in Ollama."""
 
@@ -56,8 +78,8 @@ def get_judge_warning():
 def judge(question, answer, context, llm=None):
     """Grade one answer for faithfulness and relevance. The only judge implementation (AD-7).
 
-    Returns {"faithfulness_score", "relevance_score", "faithfulness_reasoning", "relevance_reasoning"}
-    with scores on the existing 0-100 scale (None when the evaluator gave no score).
+    Returns {"faithfulness", "relevance", "faithfulness_reasoning", "relevance_reasoning"} where each
+    metric is "pass", "fail" or "error" (the evaluator gave no usable score).
     """
     if llm is None:
         llm = ChatOllama(model=JUDGE_MODEL, temperature=0.0)
@@ -90,12 +112,9 @@ def judge(question, answer, context, llm=None):
             ) from error
         raise
 
-    def to_percent(raw):
-        return None if raw is None else raw * 100
-
     return {
-        "faithfulness_score": to_percent(f_eval.get("score")),
-        "relevance_score": to_percent(r_eval.get("score")),
+        "faithfulness": verdict_from_score(f_eval.get("score")),
+        "relevance": verdict_from_score(r_eval.get("score")),
         "faithfulness_reasoning": f_eval.get("reasoning"),
         "relevance_reasoning": r_eval.get("reasoning"),
     }
@@ -173,8 +192,8 @@ class RAGState(TypedDict):
     retrieved_chunks: list   # [{chunk_id, page_no, content}] behind the numbered context
     answer: str
     citations: list          # [{chunk_id, page_no, quote}]
-    faithfulness_score: int  # New: Did it use only the context?
-    relevance_score: int     # New: Did it answer the prompt?
+    faithfulness: str        # "pass" | "fail" | "error": did it use only the context?
+    relevance: str           # "pass" | "fail" | "error": did it answer the prompt?
 
 def create_multi_agent_workflow(retriever):
     # We use format="json" for the evaluator to ensure we get a parseable response
@@ -229,39 +248,42 @@ def create_multi_agent_workflow(retriever):
         if warning:
             warnings.warn(warning)
 
-        result = judge(state["question"], state["answer"], state["context"])
+        try:
+            result = judge(state["question"], state["answer"], state["context"])
+        except JudgeModelNotFound:
+            raise  # a setup problem the user must fix; the app shows the message
+        except Exception as error:
+            # The judge could not grade: an error verdict, never a silent fail (AD-3)
+            print(f"Evaluator failed: {error}")
+            result = {
+                "faithfulness": "error", "relevance": "error",
+                "faithfulness_reasoning": None, "relevance_reasoning": None,
+            }
 
         print(f"\n[LANGCHAIN EVALUATOR REASONING]")
-        print(f"Faithfulness: {result['faithfulness_reasoning']}")
-        print(f"Relevance: {result['relevance_reasoning']}\n")
-
-        # Existing behavior kept: a missing score becomes 0 (story 4.1 changes this)
-        f_score = result["faithfulness_score"] if result["faithfulness_score"] is not None else 0
-        r_score = result["relevance_score"] if result["relevance_score"] is not None else 0
+        print(f"Faithfulness ({result['faithfulness']}): {result['faithfulness_reasoning']}")
+        print(f"Relevance ({result['relevance']}): {result['relevance_reasoning']}\n")
 
         # --- THE LANGSMITH OBSERVABILITY PUSH ---
-        # 1. Grab the unique ID for this specific execution trace
-        run_id = config.get("run_id")
-        
+        # The same verdict the UI shows: pass 1, fail 0, error sends nothing.
+        # LangGraph does not pass the root run id to nodes, so the caller supplies it as
+        # configurable["ls_run_id"], the id the app gave the invocation. Confirm against a real
+        # trace that feedback lands on the root run (story 4.2).
+        run_id = None
+        if tracing_enabled():
+            run_id = (config.get("configurable") or {}).get("ls_run_id") or config.get("run_id")
+
         if run_id:
             try:
-                # 2. Push Faithfulness to the dashboard (LangSmith prefers 0.0 to 1.0 floats)
-                ls_client.create_feedback(
-                    run_id,
-                    key="faithfulness",
-                    score=f_score, 
-                )
-                # 3. Push Relevance to the dashboard
-                ls_client.create_feedback(
-                    run_id,
-                    key="relevance",
-                    score=r_score,
-                )
-                print("Successfully pushed QA metrics to LangSmith Dashboard!")
+                for key in ("faithfulness", "relevance"):
+                    score = verdict_to_score(result[key])
+                    if score is not None:
+                        ls_client.create_feedback(run_id, key=key, score=score)
+                print("Pushed QA verdicts to the LangSmith dashboard.")
             except Exception as e:
                 print(f"Failed to push metrics to LangSmith: {e}")
 
-        return {"faithfulness_score": int(f_score), "relevance_score": int(r_score)}
+        return {"faithfulness": result["faithfulness"], "relevance": result["relevance"]}
 
     # ==========================================
     # Build the Graph

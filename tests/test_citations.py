@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -89,32 +90,40 @@ class VerifyCitationsTests(unittest.TestCase):
         self.assertEqual(agents.verify_citations([self.cite("x", "c9"), self.cite("  ")], self.RETRIEVED), [])
 
 
+RUN_ID = "11111111-1111-1111-1111-111111111111"
+PASS = {"faithfulness": "pass", "relevance": "pass", "faithfulness_reasoning": "", "relevance_reasoning": ""}
+
+
 class GraphTests(unittest.TestCase):
     """The whole graph with the LLMs, the judge and LangSmith replaced."""
 
-    def _run(self, reply, judge_result):
+    tracing = "true"
+
+    def _run(self, reply, judge_result, config=None, judge_side_effect=None):
         class Retriever:
             def invoke(self, question):
                 return [doc("c1", 4, "The sky is blue."), doc("c2", 9, "Grass is green.")]
 
         fake = FakeListChatModel(responses=[reply])
         with mock.patch.object(agents, "ChatOllama", side_effect=lambda **kwargs: fake), \
-             mock.patch.object(agents, "judge", return_value=judge_result) as judge, \
-             mock.patch.object(agents, "ls_client"):
+             mock.patch.object(agents, "judge", return_value=judge_result, side_effect=judge_side_effect) as judge, \
+             mock.patch.object(agents, "ls_client") as ls_client, \
+             mock.patch.dict(os.environ, {"LANGCHAIN_TRACING_V2": self.tracing}):
+            self.ls_client = ls_client
             workflow = agents.create_multi_agent_workflow(Retriever())
             state = workflow.invoke({
                 "question": "What colour is the sky?", "context": "", "retrieved_chunks": [],
-                "answer": "", "citations": [], "faithfulness_score": 0, "relevance_score": 0,
-            })
+                "answer": "", "citations": [], "faithfulness": "", "relevance": "",
+            }, config=config)
         return state, judge
 
     def test_final_state_holds_citations_and_the_judge_sees_the_numbered_context(self):
         reply = json.dumps({"answer": "Blue.", "citations": [{"chunk_id": "c1", "quote": "The sky is blue."}]})
-        scores = {"faithfulness_score": 100, "relevance_score": 100, "faithfulness_reasoning": "", "relevance_reasoning": ""}
+        scores = PASS
         state, judge = self._run(reply, scores)
         self.assertEqual(state["answer"], "Blue.")
         self.assertEqual(state["citations"], [{"chunk_id": "c1", "page_no": 4, "quote": "The sky is blue."}])
-        self.assertEqual((state["faithfulness_score"], state["relevance_score"]), (100, 100))
+        self.assertEqual((state["faithfulness"], state["relevance"]), ("pass", "pass"))
         args = judge.call_args.args
         self.assertEqual(args[0], "What colour is the sky?")
         self.assertEqual(args[1], "Blue.")
@@ -124,15 +133,41 @@ class GraphTests(unittest.TestCase):
         reply = json.dumps({"answer": "Blue.", "citations": [
             {"chunk_id": "c1", "quote": "The sky is blue."}, {"chunk_id": "c1", "quote": "The sky is purple."},
         ]})
-        scores = {"faithfulness_score": 100, "relevance_score": 100, "faithfulness_reasoning": "", "relevance_reasoning": ""}
+        scores = PASS
         state, _ = self._run(reply, scores)
         self.assertEqual([c["quote"] for c in state["citations"]], ["The sky is blue."])
 
-    def test_a_missing_score_still_becomes_zero_until_story_4_1(self):
+    def test_a_failed_evaluator_is_an_error_verdict(self):
         reply = json.dumps({"answer": "Blue.", "citations": []})
-        scores = {"faithfulness_score": None, "relevance_score": None, "faithfulness_reasoning": "", "relevance_reasoning": ""}
-        state, _ = self._run(reply, scores)
-        self.assertEqual((state["faithfulness_score"], state["relevance_score"]), (0, 0))
+        state, _ = self._run(reply, None, judge_side_effect=RuntimeError("connection refused"))
+        self.assertEqual((state["faithfulness"], state["relevance"]), ("error", "error"))
+
+    def test_a_missing_judge_model_is_not_swallowed(self):
+        reply = json.dumps({"answer": "Blue.", "citations": []})
+        with self.assertRaises(agents.JudgeModelNotFound):
+            self._run(reply, None, judge_side_effect=agents.JudgeModelNotFound("ollama pull x"))
+
+    def test_no_feedback_is_attempted_when_tracing_is_off(self):
+        reply = json.dumps({"answer": "Blue.", "citations": []})
+        self.tracing = "false"
+        try:
+            self._run(reply, PASS, config={"run_id": RUN_ID, "configurable": {"ls_run_id": RUN_ID}})
+        finally:
+            self.tracing = "true"
+        self.ls_client.create_feedback.assert_not_called()
+
+    def test_langsmith_gets_the_same_verdicts_and_nothing_for_an_error(self):
+        reply = json.dumps({"answer": "Blue.", "citations": []})
+        verdicts = {"faithfulness": "pass", "relevance": "fail", "faithfulness_reasoning": "", "relevance_reasoning": ""}
+        self._run(reply, verdicts, config={"run_id": RUN_ID, "configurable": {"ls_run_id": RUN_ID}})
+        sent = {c.kwargs["key"]: c.kwargs["score"] for c in self.ls_client.create_feedback.call_args_list}
+        self.assertEqual(sent, {"faithfulness": 1, "relevance": 0})
+        self.assertEqual(self.ls_client.create_feedback.call_args.args[0], RUN_ID)
+
+        errors = {"faithfulness": "error", "relevance": "pass", "faithfulness_reasoning": "", "relevance_reasoning": ""}
+        self._run(reply, errors, config={"run_id": RUN_ID, "configurable": {"ls_run_id": RUN_ID}})
+        sent = {c.kwargs["key"]: c.kwargs["score"] for c in self.ls_client.create_feedback.call_args_list}
+        self.assertEqual(sent, {"relevance": 1})
 
 
 if __name__ == "__main__":

@@ -12,9 +12,19 @@ class JudgeTests(unittest.TestCase):
     def test_judge_uses_the_supplied_llm_and_maps_scores(self):
         llm = FakeListChatModel(responses=["The answer sticks to the context.\nY", "It answers the question.\nN"])
         result = agents.judge("q?", "a", "ctx", llm=llm)
-        self.assertEqual(result["faithfulness_score"], 100)
-        self.assertEqual(result["relevance_score"], 0)
+        self.assertEqual(result["faithfulness"], "pass")
+        self.assertEqual(result["relevance"], "fail")
         self.assertIn("context", result["faithfulness_reasoning"])
+
+    def test_an_unparseable_score_is_an_error_verdict_not_a_fail(self):
+        with mock.patch.object(agents, "load_evaluator") as load:
+            load.return_value.evaluate_strings.return_value = {"score": None, "reasoning": "unclear"}
+            result = agents.judge("q", "a", "c", llm=object())
+        self.assertEqual((result["faithfulness"], result["relevance"]), ("error", "error"))
+
+    def test_verdict_mapping(self):
+        self.assertEqual([agents.verdict_from_score(v) for v in (1, 0, None, 0.5)], ["pass", "fail", "error", "error"])
+        self.assertEqual([agents.verdict_to_score(v) for v in ("pass", "fail", "error", "")], [1, 0, None, None])
 
     def test_default_judge_builds_the_judge_model_not_the_answer_model(self):
         with mock.patch.object(agents, "ChatOllama") as chat, \
