@@ -1,0 +1,41 @@
+import unittest
+from unittest import mock
+
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+import agents
+
+
+class JudgeTests(unittest.TestCase):
+    def test_judge_uses_the_supplied_llm_and_maps_scores(self):
+        llm = FakeListChatModel(responses=["The answer sticks to the context.\nY", "It answers the question.\nN"])
+        result = agents.judge("q?", "a", "ctx", llm=llm)
+        self.assertEqual(result["faithfulness_score"], 100)
+        self.assertEqual(result["relevance_score"], 0)
+        self.assertIn("context", result["faithfulness_reasoning"])
+
+    def test_default_judge_builds_the_judge_model_not_the_answer_model(self):
+        with mock.patch.object(agents, "ChatOllama") as chat, \
+             mock.patch.object(agents, "load_evaluator") as load:
+            load.return_value.evaluate_strings.return_value = {"score": 1, "reasoning": "r"}
+            agents.judge("q", "a", "c")
+        chat.assert_called_once()
+        self.assertEqual(chat.call_args.kwargs["model"], agents.JUDGE_MODEL)
+
+    def test_warning_only_when_judge_equals_answerer(self):
+        with mock.patch.object(agents, "JUDGE_MODEL", agents.LLM_MODEL):
+            self.assertIn("self-grading", agents.get_judge_warning())
+        with mock.patch.object(agents, "JUDGE_MODEL", "some-other-model"):
+            self.assertIsNone(agents.get_judge_warning())
+
+    def test_equal_models_are_detected_despite_case_and_latest_tag(self):
+        for variant in ("llama3:latest", "Llama3", " llama3 "):
+            with mock.patch.object(agents, "JUDGE_MODEL", variant):
+                self.assertIsNotNone(agents.get_judge_warning(), variant)
+
+    def test_judge_and_answer_models_differ_by_default(self):
+        self.assertNotEqual(agents.JUDGE_MODEL, agents.LLM_MODEL)
+
+
+if __name__ == "__main__":
+    unittest.main()

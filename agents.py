@@ -7,6 +7,8 @@ ls_client = Client()
 
 
 import json
+import os
+import warnings
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
@@ -22,6 +24,68 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_classic.evaluation import load_evaluator
 
 LLM_MODEL = "llama3"
+
+# The judge grades answers and must not be the model that wrote them (AD-4).
+# Override with the JUDGE_MODEL environment variable; pull the model with Ollama first.
+JUDGE_MODEL = os.getenv("JUDGE_MODEL", "").strip() or "qwen2.5:14b"
+
+
+def _same_model(a, b):
+    """Ollama treats 'llama3' and 'llama3:latest' as one model; compare case-insensitively."""
+    def normalize(name):
+        name = name.strip().lower()
+        return name[: -len(":latest")] if name.endswith(":latest") else name
+    return normalize(a) == normalize(b)
+
+
+def get_judge_warning():
+    """Return a warning when the judge and the answering model are the same, else None."""
+    if _same_model(JUDGE_MODEL, LLM_MODEL):
+        return (
+            f"Judge model and answering model are both '{LLM_MODEL}': "
+            "self-grading is biased. Set JUDGE_MODEL to a different model."
+        )
+    return None
+
+
+def judge(question, answer, context, llm=None):
+    """Grade one answer for faithfulness and relevance. The only judge implementation (AD-7).
+
+    Returns {"faithfulness_score", "relevance_score", "faithfulness_reasoning", "relevance_reasoning"}
+    with scores on the existing 0-100 scale (None when the evaluator gave no score).
+    """
+    if llm is None:
+        llm = ChatOllama(model=JUDGE_MODEL, temperature=0.0)
+
+    faithfulness_evaluator = load_evaluator(
+        "labeled_criteria",
+        criteria={
+            "faithfulness": "Is the submission strictly based on the provided reference context, without introducing any outside information?"
+        },
+        llm=llm,
+    )
+    relevance_evaluator = load_evaluator(
+        "criteria",
+        criteria={
+            "relevance": "Does the submission directly and completely answer the user's input question?"
+        },
+        llm=llm,
+    )
+
+    f_eval = faithfulness_evaluator.evaluate_strings(
+        prediction=answer, input=question, reference=context
+    )
+    r_eval = relevance_evaluator.evaluate_strings(prediction=answer, input=question)
+
+    def to_percent(raw):
+        return None if raw is None else raw * 100
+
+    return {
+        "faithfulness_score": to_percent(f_eval.get("score")),
+        "relevance_score": to_percent(r_eval.get("score")),
+        "faithfulness_reasoning": f_eval.get("reasoning"),
+        "relevance_reasoning": r_eval.get("reasoning"),
+    }
 
 # 1. Updated Graph State
 class RAGState(TypedDict):
@@ -69,71 +133,21 @@ def create_multi_agent_workflow(retriever):
     # Agent 3: The Evaluator (LangChain Native)
     # ==========================================
     def evaluator_node(state: RAGState, config: RunnableConfig):
-        print("--- EVALUATOR: Grading Response using LangChain Native Evaluators ---")
-        
-        # WHY WE CHANGED THIS: We no longer need `llm_json`. 
-        # LangChain's CriteriaEvalChain uses advanced prompt engineering (Chain-of-Thought) 
-        # under the hood and handles the string-to-boolean parsing natively.
-        llm = ChatOllama(model=LLM_MODEL, temperature=0.0)
+        print(f"--- EVALUATOR: Grading Response with judge model '{JUDGE_MODEL}' ---")
 
-        # 1. Define custom criteria for Faithfulness (Hallucination Check)
-        faithfulness_criteria = {
-            "faithfulness": "Is the submission strictly based on the provided reference context, without introducing any outside information?"
-        }
-        
-        # 2. Load the "labeled_criteria" evaluator
-        # WHY WE CHANGED THIS: The "labeled_criteria" type explicitly requires a 'reference' 
-        # parameter. This allows us to pass our retrieved ChromaDB chunks as the absolute truth.
-        faithfulness_evaluator = load_evaluator(
-            "labeled_criteria", 
-            criteria=faithfulness_criteria, 
-            llm=llm
-        )
+        warning = get_judge_warning()
+        if warning:
+            warnings.warn(warning)
 
-        # 3. Define custom criteria for Relevance (Helpfulness Check)
-        relevance_criteria = {
-            "relevance": "Does the submission directly and completely answer the user's input question?"
-        }
-        
-        # 4. Load the standard "criteria" evaluator
-        # WHY WE CHANGED THIS: Relevance only cares if the answer matches the question. 
-        # It doesn't need to look at the database context, so we use the standard "criteria" type.
-        relevance_evaluator = load_evaluator(
-            "criteria", 
-            criteria=relevance_criteria, 
-            llm=llm
-        )
+        result = judge(state["question"], state["answer"], state["context"])
 
-        # --- Execution ---
-        print("Evaluating Faithfulness...")
-        f_eval = faithfulness_evaluator.evaluate_strings(
-            prediction=state["answer"],
-            input=state["question"],
-            reference=state["context"] # The "labeled_criteria" uses this as the source of truth
-        )
-
-        print("Evaluating Relevance...")
-        r_eval = relevance_evaluator.evaluate_strings(
-            prediction=state["answer"],
-            input=state["question"]
-        )
-
-        # --- Parsing the Output ---
-        # The "Defensive Programming" Fix
-        # LangChain evaluators output a dictionary containing: 
-        # 'reasoning' (the Chain of Thought), 'value' ('Y'/'N'), and 'score' (1 or 0)
-        
-        # --- Parsing the Output (Defensive) ---
         print(f"\n[LANGCHAIN EVALUATOR REASONING]")
-        print(f"Faithfulness: {f_eval.get('reasoning')}")
-        print(f"Relevance: {r_eval.get('reasoning')}\n")
+        print(f"Faithfulness: {result['faithfulness_reasoning']}")
+        print(f"Relevance: {result['relevance_reasoning']}\n")
 
-            # Extract the raw score safely (your defensive fix!)
-        raw_f = f_eval.get("score")
-        raw_r = r_eval.get("score")
-
-        f_score = (raw_f if raw_f is not None else 0) * 100
-        r_score = (raw_r if raw_r is not None else 0) * 100
+        # Existing behavior kept: a missing score becomes 0 (story 4.1 changes this)
+        f_score = result["faithfulness_score"] if result["faithfulness_score"] is not None else 0
+        r_score = result["relevance_score"] if result["relevance_score"] is not None else 0
 
         # --- THE LANGSMITH OBSERVABILITY PUSH ---
         # 1. Grab the unique ID for this specific execution trace

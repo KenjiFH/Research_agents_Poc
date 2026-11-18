@@ -5,10 +5,15 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
-from agents import create_multi_agent_workflow
+from agents import create_multi_agent_workflow, get_judge_warning
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
 st.title("🤖 Multi-Agent RAG Assistant")
+
+# AD-4: the judge must not be the answering model; make a misconfiguration visible
+_judge_warning = get_judge_warning()
+if _judge_warning:
+    st.warning(_judge_warning)
 
 # Initialize Session State
 if "workflow" not in st.session_state:
