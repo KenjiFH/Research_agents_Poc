@@ -1,5 +1,6 @@
 import tempfile
 import os
+import uuid
 import pandas as pd
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
@@ -61,11 +62,31 @@ def tag_chunks(chunks):
     return chunks
 
 
+def new_collection_name():
+    """A unique Chroma collection name, one per upload (AD-6)."""
+    return f"poc_rag_{uuid.uuid4().hex[:12]}"
+
+
+def build_vector_store(chunks, embeddings):
+    """Embed chunks into a brand-new, uniquely named collection and return the store."""
+    return Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        collection_name=new_collection_name()
+    )
+
+
+def delete_vector_store(vector_store):
+    """Delete an upload's collection so a later upload never sees its chunks."""
+    if vector_store is not None:
+        vector_store.delete_collection()
+
+
 def process_document_and_create_vdb(uploaded_file):
     """
     Takes a Streamlit UploadedFile, processes it with Docling (OCR enabled),
     isolates tables and images with look-back metadata tagging,
-    and returns a Chroma retriever and raw chunks.
+    and returns a Chroma retriever, the chunks, and the per-upload vector store.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
         temp_file.write(uploaded_file.getvalue())
@@ -262,15 +283,12 @@ def process_document_and_create_vdb(uploaded_file):
             model=EMBEDDING_MODEL
         )
 
-        vector_store = Chroma.from_documents(
-            documents=final_chunks,
-            embedding=embeddings,
-            collection_name="poc_rag_collection"
-        )
+        vector_store = build_vector_store(final_chunks, embeddings)
 
         return (
             vector_store.as_retriever(search_kwargs={"k": 4}),
-            final_chunks
+            final_chunks,
+            vector_store
         )
 
     finally:
