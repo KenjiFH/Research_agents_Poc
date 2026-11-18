@@ -52,3 +52,6 @@ def citation_title(citation):
 def sources_note(citations):
     """A note for the UI when an answer has no verified citations, else None (AD-5, story 2.3)."""
     return None if citations else NO_SOURCES_NOTE
+
+
+ABSTAINED_WARNING = "The answer could not be verified against the document, so it was withheld."

@@ -56,6 +56,26 @@ def tracing_enabled():
     return False
 
 
+# Abstention shown instead of an answer that failed the faithfulness check twice (AD-8).
+ABSTENTION_MESSAGE = "I can't verify an answer to this question from the document."
+
+
+def gate_enabled():
+    """The faithfulness gate is off until GATE_ENABLED is set; switch it on once the judge is
+    validated against human labels (story 3.3)."""
+    return os.getenv("GATE_ENABLED", "").strip().lower() in ("true", "1", "yes")
+
+
+def gate_decision(faithfulness, retry_count):
+    """What happens after grading (AD-1): "retry" once on a fail, then "abstain", else "end".
+
+    An "error" verdict never retries or abstains (AD-3), and nothing happens while the gate is off.
+    """
+    if not gate_enabled() or faithfulness != "fail":
+        return "end"
+    return "retry" if retry_count < 1 else "abstain"
+
+
 def verdict_to_score(verdict):
     """LangSmith feedback score for a verdict: pass 1, fail 0, error None (nothing is sent)."""
     return {"pass": 1, "fail": 0}.get(verdict)
@@ -194,6 +214,9 @@ class RAGState(TypedDict):
     citations: list          # [{chunk_id, page_no, quote}]
     faithfulness: str        # "pass" | "fail" | "error": did it use only the context?
     relevance: str           # "pass" | "fail" | "error": did it answer the prompt?
+    retry_count: int         # synthesis retries used (capped at one, AD-1)
+    abstained: bool          # True when the answer was withheld (AD-8)
+    gate: str                # "retry" | "abstain" | "end": decided once, by the evaluator (AD-1)
 
 def create_multi_agent_workflow(retriever):
     # We use format="json" for the evaluator to ensure we get a parseable response
@@ -269,13 +292,17 @@ def create_multi_agent_workflow(retriever):
         # LangGraph does not pass the root run id to nodes, so the caller supplies it as
         # configurable["ls_run_id"], the id the app gave the invocation. Confirm against a real
         # trace that feedback lands on the root run (story 4.2).
+        # A graded answer that will be retried is not the final verdict, so it sends nothing.
         run_id = None
-        if tracing_enabled():
+        decision = gate_decision(result["faithfulness"], state.get("retry_count", 0))
+        if tracing_enabled() and decision != "retry":
             run_id = (config.get("configurable") or {}).get("ls_run_id") or config.get("run_id")
 
         if run_id:
             try:
-                for key in ("faithfulness", "relevance"):
+                # A withheld answer has no meaningful relevance, so only faithfulness is sent
+                keys = ("faithfulness",) if decision == "abstain" else ("faithfulness", "relevance")
+                for key in keys:
                     score = verdict_to_score(result[key])
                     if score is not None:
                         ls_client.create_feedback(run_id, key=key, score=score)
@@ -283,7 +310,22 @@ def create_multi_agent_workflow(retriever):
             except Exception as e:
                 print(f"Failed to push metrics to LangSmith: {e}")
 
-        return {"faithfulness": result["faithfulness"], "relevance": result["relevance"]}
+        return {"faithfulness": result["faithfulness"], "relevance": result["relevance"], "gate": decision}
+
+    # ==========================================
+    # Retry and Abstain (the faithfulness gate)
+    # ==========================================
+    def retry_node(state: RAGState):
+        print("--- GATE: faithfulness failed, retrying synthesis once ---")
+        return {"retry_count": state.get("retry_count", 0) + 1}
+
+    def abstain_node(state: RAGState):
+        print("--- GATE: faithfulness failed again, abstaining ---")
+        # The relevance grade belonged to the withheld answer, so it no longer applies
+        return {"answer": ABSTENTION_MESSAGE, "citations": [], "abstained": True, "relevance": ""}
+
+    def route_after_evaluation(state: RAGState):
+        return {"retry": "retry", "abstain": "abstain", "end": END}[state["gate"]]
 
     # ==========================================
     # Build the Graph
@@ -296,11 +338,18 @@ def create_multi_agent_workflow(retriever):
     workflow.add_node("researcher", researcher_node)
     workflow.add_node("synthesizer", synthesizer_node)
     workflow.add_node("evaluator", evaluator_node)
+    workflow.add_node("retry", retry_node)
+    workflow.add_node("abstain", abstain_node)
 
-    # Updated Flow: Researcher -> Synthesizer -> Evaluator -> END
+    # Flow: Researcher -> Synthesizer -> Evaluator -> (gate) END | retry -> Synthesizer | abstain -> END
+    # The only conditional edge branches on the faithfulness verdict; the model never picks a node (AD-1).
     workflow.set_entry_point("researcher")
     workflow.add_edge("researcher", "synthesizer")
     workflow.add_edge("synthesizer", "evaluator")
-    workflow.add_edge("evaluator", END)
+    workflow.add_conditional_edges(
+        "evaluator", route_after_evaluation, {"retry": "retry", "abstain": "abstain", END: END}
+    )
+    workflow.add_edge("retry", "synthesizer")
+    workflow.add_edge("abstain", END)
     
     return workflow.compile()

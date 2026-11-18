@@ -48,6 +48,22 @@ class AppRenderTests(unittest.TestCase):
         self.assertEqual([m.value for m in at.metric], ["❌ Fail", "✅ Pass"])
         self.assertEqual(len(at.warning), 1)
 
+    def test_an_abstained_answer_shows_its_own_warning_and_no_sources_note(self):
+        at = ask({"answer": "I can't verify an answer to this question from the document.", "citations": [],
+                  "faithfulness": "fail", "relevance": "", "abstained": True})
+        self.assertEqual(len(at.exception), 0)
+        self.assertEqual([c.value for c in at.caption], [])
+        self.assertEqual([w.value for w in at.warning], [session_logic.ABSTAINED_WARNING])
+        self.assertEqual([m.value for m in at.metric], ["❌ Fail", "– Not graded"])
+
+    def test_an_abstained_answer_keeps_its_warning_and_no_note_after_a_rerun(self):
+        at = ask({"answer": "I can't verify an answer to this question from the document.", "citations": [],
+                  "faithfulness": "fail", "relevance": "", "abstained": True})
+        with mock.patch.object(session_logic, "upload_action", return_value="none"):
+            at.run()
+        self.assertEqual([c.value for c in at.caption], [])
+        self.assertEqual([w.value for w in at.warning], [session_logic.ABSTAINED_WARNING])
+
     def test_citations_survive_a_rerun_in_the_history(self):
         at = ask({**BASE, "citations": [{"chunk_id": "c2", "page_no": 7, "quote": "Grass is green."}]})
         with mock.patch.object(session_logic, "upload_action", return_value="none"):

@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
-from session_logic import upload_action, verdict_label, verdict_warning, citation_title, sources_note
+from session_logic import upload_action, verdict_label, verdict_warning, citation_title, sources_note, ABSTAINED_WARNING
 from agents import create_multi_agent_workflow, get_judge_warning, JudgeModelNotFound
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
@@ -94,12 +94,13 @@ with st.sidebar:
         reset_session()
         st.rerun()
 
-def render_metrics(faithfulness, relevance):
+def render_metrics(faithfulness, relevance, abstained=False):
     """Show each check as Pass / Fail / Error, with a warning when the answer should not be trusted."""
     col1, col2 = st.columns(2)
     col1.metric("🔍 Faithfulness (Hallucination Check)", verdict_label(faithfulness))
     col2.metric("🎯 Relevance (Accuracy Check)", verdict_label(relevance))
-    warning = verdict_warning(faithfulness, relevance)
+    # An abstained answer has its own warning and no sources (AD-8)
+    warning = ABSTAINED_WARNING if abstained else verdict_warning(faithfulness, relevance)
     if warning:
         st.warning(warning)
 
@@ -123,10 +124,10 @@ st.header("2. Ask the Agents")
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if msg["role"] == "assistant":
+        if msg["role"] == "assistant" and not msg.get("abstained", False):
             render_sources(msg.get("citations", []))
         if msg["role"] == "assistant" and "metrics" in msg:
-            render_metrics(msg["metrics"]["faithfulness"], msg["metrics"]["relevance"])
+            render_metrics(msg["metrics"]["faithfulness"], msg["metrics"]["relevance"], msg.get("abstained", False))
 
 if prompt := st.chat_input("Ask a question about your document..."):
     if st.session_state.workflow is None:
@@ -145,7 +146,9 @@ if prompt := st.chat_input("Ask a question about your document..."):
                     "answer": "", 
                     "citations": [],
                     "faithfulness": "", 
-                    "relevance": ""
+                    "relevance": "",
+                    "retry_count": 0,
+                    "abstained": False
                 }
                 
                 try:
@@ -163,14 +166,17 @@ if prompt := st.chat_input("Ask a question about your document..."):
                 relevance = final_state["relevance"]
                 
                 citations = final_state.get("citations", [])
+                abstained = final_state.get("abstained", False)
 
                 st.markdown(response)
-                render_sources(citations)
-                render_metrics(faithfulness, relevance)
+                if not abstained:
+                    render_sources(citations)
+                render_metrics(faithfulness, relevance, abstained)
                 
         st.session_state.messages.append({
             "role": "assistant", 
             "content": response,
             "citations": citations,
+            "abstained": abstained,
             "metrics": {"faithfulness": faithfulness, "relevance": relevance}
         })
