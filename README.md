@@ -21,11 +21,11 @@ A local, stateless proof of concept for asking questions about a PDF and being a
 - Several first drafts of new features had real bugs that independent review caught before they shipped, for example a de-duplication rule that could drop the chunk containing the answer.
 
 **What the BMad method gave this project**
-- **Requirements before code.** Each weakness became a numbered, checkable requirement, so "done" was something you could test, not a feeling.
+- **Requirements before code.** Each weakness became a numbered, checkable requirement
 - **A short architecture contract.** A handful of binding decisions (how the graph routes, who owns shared data, what a verdict looks like, how citations are shaped) kept separately built pieces consistent and prevented rework.
 - **Small, ordered steps.** Work was split into small changes in dependency order, each with a plain statement of how to verify it.
 - **An independent review of every change.** A fresh reviewer read each change against its plan and the architecture, and every finding was fixed, rejected with a reason, or deferred in writing. Reviews caught real bugs that tests written by the author had missed.
-- **Decisions and evidence on record.** Choices (such as keeping the gate off until the judge is validated) and measured results were written down instead of living in someone's head.
+- **Decisions and evidence on record.** Choices (such as keeping the gate off until the judge is validated) and measured results were written down and logged in the dev ouput in terminal
 
 ## How it works
 
