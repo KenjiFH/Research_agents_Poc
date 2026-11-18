@@ -12,6 +12,7 @@ from langchain_ollama import OllamaEmbeddings
 
 # Using our local Ollama embedding model
 EMBEDDING_MODEL = "nomic-embed-text"
+RETRIEVER_K = 4
 
 
 def extract_safe_text(obj, default=""):
@@ -76,10 +77,170 @@ def build_vector_store(chunks, embeddings):
     )
 
 
+def make_retriever(vector_store):
+    """The retriever bound to one upload's store."""
+    return vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
+
+
 def delete_vector_store(vector_store):
     """Delete an upload's collection so a later upload never sees its chunks."""
     if vector_store is not None:
         vector_store.delete_collection()
+
+
+def items_to_raw_documents(items):
+    """Turn Docling (item, level) pairs, in reading order, into typed raw documents.
+
+    Text is buffered and flushed at tables, pictures and page changes; every document gets page_no.
+    """
+    raw_documents = []
+    current_text_buffer = ""
+    buffer_page = 1  # page the buffered text started on
+    last_page = 1  # last page seen; page-less items inherit it so page_no is always an int
+    last_seen_text = "Untitled Document Element"
+
+    # Iterate through elements in strict reading order
+    for item, level in items:
+        item_label = getattr(item, "label", "")
+        item_page = get_page_no(item, default=last_page)
+        last_page = item_page
+
+        # --- INTERCEPT TABLES ---
+        if item_label == "table":
+            # Flush text buffer FIRST so we can use its tail end as context
+            preceding_context = ""
+            if current_text_buffer.strip():
+                # Save the last ~200 characters of the buffer as semantic context
+                preceding_context = current_text_buffer.strip()[-200:]
+                
+                raw_documents.append(
+                    Document(
+                        page_content=current_text_buffer.strip(),
+                        metadata={"type": "text", "page_no": buffer_page}
+                    )
+                )
+                current_text_buffer = ""
+
+            # Convert table to markdown
+            try:
+                df = item.export_to_dataframe()
+                table_md = df.to_markdown(index=False)
+            except Exception as e:
+                print(f"Skipping malformed table: {e}")
+                continue
+
+            # Smarter caption extraction
+            if hasattr(item, "captions") and item.captions:
+                caption = extract_safe_text(
+                    item.captions[0],
+                    default="Untitled Table"
+                )
+            else:
+                caption = last_seen_text.strip()
+
+            # Inject the preceding paragraph directly into the table chunk
+            enriched_table_text = (
+                f"DOCUMENT TABLE: {caption}\n"
+                f"Preceding Context: {preceding_context}\n\n"
+                f"{table_md}"
+            )
+
+            raw_documents.append(
+                Document(
+                    page_content=enriched_table_text,
+                    metadata={
+                        "type": "table",
+                        "title": caption,
+                        "page_no": item_page
+                    }
+                )
+            )
+
+        # --- INTERCEPT IMAGES / FIGURES ---
+        elif item_label == "picture":
+            preceding_context = ""
+            if current_text_buffer.strip():
+                preceding_context = current_text_buffer.strip()[-200:]
+                
+                raw_documents.append(
+                    Document(
+                        page_content=current_text_buffer.strip(),
+                        metadata={"type": "text", "page_no": buffer_page}
+                    )
+                )
+                current_text_buffer = ""
+
+            if hasattr(item, "captions") and item.captions:
+                caption = extract_safe_text(
+                    item.captions[0],
+                    default="Untitled Image/Figure"
+                )
+            else:
+                caption = last_seen_text.strip()
+
+            enriched_image_text = (
+                "DOCUMENT VISUAL ELEMENT (Image/Graph/Diagram)\n"
+                f"Context/Title: {caption}\n"
+                f"Preceding Context: {preceding_context}\n"
+            )
+
+            # OCR text
+            if hasattr(item, "text") and item.text:
+                enriched_image_text += f"\nExtracted Text from Image: {item.text}"
+
+            # Image annotations
+            if hasattr(item, "annotations") and item.annotations:
+                enriched_image_text += f"\nExtracted Image Details: {item.annotations}"
+
+            raw_documents.append(
+                Document(
+                    page_content=enriched_image_text.strip(),
+                    metadata={
+                        "type": "image",
+                        "title": caption,
+                        "source_element": "picture",
+                        "page_no": item_page
+                    }
+                )
+            )
+
+        # --- COLLECT NORMAL TEXT ---
+        elif item_label in ["text", "paragraph", "section_header", "title", "list_item"]:
+            text = extract_safe_text(item)
+
+            if text:
+                # Never let one text chunk span two pages, so page_no stays exact
+                if current_text_buffer.strip() and item_page != buffer_page:
+                    raw_documents.append(
+                        Document(
+                            page_content=current_text_buffer.strip(),
+                            metadata={"type": "text", "page_no": buffer_page}
+                        )
+                    )
+                    current_text_buffer = ""
+
+                if not current_text_buffer.strip():
+                    buffer_page = item_page
+                current_text_buffer += text + "\n\n"
+                
+                # HEURISTIC FIX: Only update last_seen_text if the chunk is meaningful
+                cleaned_text = text.strip()
+                is_meaningful_length = len(cleaned_text) > 20
+                contains_keyword = any(kw in cleaned_text.lower() for kw in ["table", "figure", "chart", "shows", "illustrates"])
+                
+                if is_meaningful_length or contains_keyword:
+                    last_seen_text = cleaned_text
+
+    # Flush remaining text
+    if current_text_buffer.strip():
+        raw_documents.append(
+            Document(
+                page_content=current_text_buffer.strip(),
+                metadata={"type": "text", "page_no": buffer_page}
+            )
+        )
+
+    return raw_documents
 
 
 def process_document_and_create_vdb(uploaded_file):
@@ -111,152 +272,7 @@ def process_document_and_create_vdb(uploaded_file):
         # 2. Convert the document
         result = converter.convert(temp_file_path)
 
-        raw_documents = []
-        current_text_buffer = ""
-        buffer_page = 1  # page the buffered text started on
-        last_page = 1  # last page seen; page-less items inherit it so page_no is always an int
-        last_seen_text = "Untitled Document Element"
-
-        # 3. Iterate through elements in strict reading order
-        for item, level in result.document.iterate_items():
-            item_label = getattr(item, "label", "")
-            item_page = get_page_no(item, default=last_page)
-            last_page = item_page
-
-            # --- INTERCEPT TABLES ---
-            if item_label == "table":
-                # Flush text buffer FIRST so we can use its tail end as context
-                preceding_context = ""
-                if current_text_buffer.strip():
-                    # Save the last ~200 characters of the buffer as semantic context
-                    preceding_context = current_text_buffer.strip()[-200:]
-                    
-                    raw_documents.append(
-                        Document(
-                            page_content=current_text_buffer.strip(),
-                            metadata={"type": "text", "page_no": buffer_page}
-                        )
-                    )
-                    current_text_buffer = ""
-
-                # Convert table to markdown
-                try:
-                    df = item.export_to_dataframe()
-                    table_md = df.to_markdown(index=False)
-                except Exception as e:
-                    print(f"Skipping malformed table: {e}")
-                    continue
-
-                # Smarter caption extraction
-                if hasattr(item, "captions") and item.captions:
-                    caption = extract_safe_text(
-                        item.captions[0],
-                        default="Untitled Table"
-                    )
-                else:
-                    caption = last_seen_text.strip()
-
-                # Inject the preceding paragraph directly into the table chunk
-                enriched_table_text = (
-                    f"DOCUMENT TABLE: {caption}\n"
-                    f"Preceding Context: {preceding_context}\n\n"
-                    f"{table_md}"
-                )
-
-                raw_documents.append(
-                    Document(
-                        page_content=enriched_table_text,
-                        metadata={
-                            "type": "table",
-                            "title": caption,
-                            "page_no": item_page
-                        }
-                    )
-                )
-
-            # --- INTERCEPT IMAGES / FIGURES ---
-            elif item_label == "picture":
-                preceding_context = ""
-                if current_text_buffer.strip():
-                    preceding_context = current_text_buffer.strip()[-200:]
-                    
-                    raw_documents.append(
-                        Document(
-                            page_content=current_text_buffer.strip(),
-                            metadata={"type": "text", "page_no": buffer_page}
-                        )
-                    )
-                    current_text_buffer = ""
-
-                if hasattr(item, "captions") and item.captions:
-                    caption = extract_safe_text(
-                        item.captions[0],
-                        default="Untitled Image/Figure"
-                    )
-                else:
-                    caption = last_seen_text.strip()
-
-                enriched_image_text = (
-                    "DOCUMENT VISUAL ELEMENT (Image/Graph/Diagram)\n"
-                    f"Context/Title: {caption}\n"
-                    f"Preceding Context: {preceding_context}\n"
-                )
-
-                # OCR text
-                if hasattr(item, "text") and item.text:
-                    enriched_image_text += f"\nExtracted Text from Image: {item.text}"
-
-                # Image annotations
-                if hasattr(item, "annotations") and item.annotations:
-                    enriched_image_text += f"\nExtracted Image Details: {item.annotations}"
-
-                raw_documents.append(
-                    Document(
-                        page_content=enriched_image_text.strip(),
-                        metadata={
-                            "type": "image",
-                            "title": caption,
-                            "source_element": "picture",
-                            "page_no": item_page
-                        }
-                    )
-                )
-
-            # --- COLLECT NORMAL TEXT ---
-            elif item_label in ["text", "paragraph", "section_header", "title", "list_item"]:
-                text = extract_safe_text(item)
-
-                if text:
-                    # Never let one text chunk span two pages, so page_no stays exact
-                    if current_text_buffer.strip() and item_page != buffer_page:
-                        raw_documents.append(
-                            Document(
-                                page_content=current_text_buffer.strip(),
-                                metadata={"type": "text", "page_no": buffer_page}
-                            )
-                        )
-                        current_text_buffer = ""
-
-                    if not current_text_buffer.strip():
-                        buffer_page = item_page
-                    current_text_buffer += text + "\n\n"
-                    
-                    # HEURISTIC FIX: Only update last_seen_text if the chunk is meaningful
-                    cleaned_text = text.strip()
-                    is_meaningful_length = len(cleaned_text) > 20
-                    contains_keyword = any(kw in cleaned_text.lower() for kw in ["table", "figure", "chart", "shows", "illustrates"])
-                    
-                    if is_meaningful_length or contains_keyword:
-                        last_seen_text = cleaned_text
-
-        # 4. Flush remaining text
-        if current_text_buffer.strip():
-            raw_documents.append(
-                Document(
-                    page_content=current_text_buffer.strip(),
-                    metadata={"type": "text", "page_no": buffer_page}
-                )
-            )
+        raw_documents = items_to_raw_documents(result.document.iterate_items())
 
         # 5. Selective chunking
         text_splitter = RecursiveCharacterTextSplitter(
@@ -286,7 +302,7 @@ def process_document_and_create_vdb(uploaded_file):
         vector_store = build_vector_store(final_chunks, embeddings)
 
         return (
-            vector_store.as_retriever(search_kwargs={"k": 4}),
+            make_retriever(vector_store),
             final_chunks,
             vector_store
         )

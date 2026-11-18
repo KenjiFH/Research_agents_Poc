@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
+from session_logic import upload_action
 from agents import create_multi_agent_workflow, get_judge_warning
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
@@ -43,13 +44,16 @@ with st.sidebar:
     st.header("1. Upload Knowledge Base")
     uploaded_file = st.file_uploader("Upload a PDF document", type=["pdf"])
     
-    # Condition 1: a file is uploaded and no agents are built for it yet
-    # (a different file than the current one counts as a new upload)
-    if uploaded_file and (
-        st.session_state.workflow is None
-        or st.session_state.file_id != uploaded_file.file_id
-    ):
-        if st.session_state.vector_store is not None:
+    action = upload_action(
+        uploaded_file.file_id if uploaded_file else None,
+        st.session_state.file_id,
+        st.session_state.workflow is not None,
+        st.session_state.vector_store is not None,
+    )
+
+    # Build agents for a new upload; a different file replaces the previous one
+    if action in ("build", "replace"):
+        if action == "replace":
             reset_session()  # delete the previous document's collection first
         with st.spinner("Processing document with Docling..."):
             # Catch the retriever, the chunks and the per-upload vector store
@@ -60,12 +64,9 @@ with st.sidebar:
             st.session_state.workflow = create_multi_agent_workflow(retriever)
             st.session_state.raw_chunks = chunks  # Save chunks to memory
         st.success("Document processed! Agents are ready.")
-        
-    # Condition 2: File removed, hard reset
-    elif uploaded_file is None and (
-        st.session_state.workflow is not None
-        or st.session_state.vector_store is not None
-    ):
+
+    # File removed: hard reset
+    elif action == "reset":
         reset_session()
         st.rerun()
 
@@ -117,6 +118,7 @@ if prompt := st.chat_input("Ask a question about your document..."):
                     "question": prompt, 
                     "context": "", 
                     "answer": "", 
+
                     "faithfulness_score": 0, 
                     "relevance_score": 0
                 }
