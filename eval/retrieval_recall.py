@@ -4,7 +4,8 @@ Run from the project root:  python3 eval/retrieval_recall.py
 
 The document is 60 boilerplate/chatter chunks plus six fact chunks. For each question it reports
 whether the chunk holding the answer was retrieved by: the old top-4 semantic retriever, the
-current semantic retriever (larger candidate set + de-duplication), and the hybrid (+ BM25).
+current semantic retriever (larger candidate set + de-duplication), the hybrid (+ BM25), and the hybrid
+with the local cross-encoder reranker (needs a one-time model download from Hugging Face).
 It is a small, synthetic check of direction, not a benchmark; run it on your own PDF's chunks for
 a real signal.
 """
@@ -47,10 +48,14 @@ def ids(docs): return [d.metadata["chunk_id"] for d in docs]
 old = lambda q: ids(store.as_retriever(search_kwargs={"k":4}).invoke(q))
 sem_only = dp.make_retriever(store)            # larger candidate set + dedup + final 6
 hybrid = dp.make_retriever(store, chunks)      # + BM25 keyword search
-res={"old k=4 semantic":0,"larger k + dedup":0,"+ BM25":0}
+reranker = dp.CrossEncoderReranker()
+reranked = dp.make_retriever(store, chunks, reranker)  # + cross-encoder rerank
+res={"old k=4 semantic":0,"larger k + dedup":0,"+ BM25":0,"+ rerank":0}
 for key,(_,q) in facts.items():
-    g=gold[key]; a=g in old(q); b=g in ids(sem_only.invoke(q)); c=g in ids(hybrid.invoke(q))
-    res["old k=4 semantic"]+=a; res["larger k + dedup"]+=b; res["+ BM25"]+=c
-    print(f"{q[:44]:44} old:{'hit ' if a else 'MISS'} larger-k+dedup:{'hit ' if b else 'MISS'} +BM25:{'hit ' if c else 'MISS'}")
+    g=gold[key]; a=g in old(q); b=g in ids(sem_only.invoke(q)); c=g in ids(hybrid.invoke(q)); r=ids(reranked.invoke(q)); d=g in r; pos=(r.index(g)+1) if d else None
+    res["old k=4 semantic"]+=a; res["larger k + dedup"]+=b; res["+ BM25"]+=c; res["+ rerank"]+=d
+    print(f"{q[:44]:44} old:{'hit ' if a else 'MISS'} larger-k+dedup:{'hit ' if b else 'MISS'} +BM25:{'hit ' if c else 'MISS'} +rerank:{'hit ' if d else 'MISS'} (rank {pos})")
 print(f"\nanswer chunk retrieved (of {len(facts)}):", res)
+if reranker.unavailable:
+    print("WARNING: the reranker could not load, so the +rerank column only repeats the hybrid order.")
 dp.delete_vector_store(store)

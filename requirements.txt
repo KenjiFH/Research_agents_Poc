@@ -149,6 +149,7 @@ rtree==1.4.1
 safetensors==0.7.0
 scipy==1.17.1
 semchunk==3.2.5
+sentence-transformers==5.7.0
 shapely==2.1.2
 shellingham==1.5.4
 six==1.17.0

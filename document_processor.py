@@ -21,6 +21,7 @@ EMBEDDING_MODEL = "nomic-embed-text"
 CANDIDATE_K = 20       # candidates drawn from each search before filtering
 FINAL_K = 6            # chunks the answerer receives
 DEDUP_THRESHOLD = 0.6  # word-shingle containment at or above this counts as a near-duplicate
+RERANKER_MODEL = os.getenv("RERANKER_MODEL", "").strip() or "cross-encoder/ms-marco-MiniLM-L-6-v2"
 RRF_K = 60             # reciprocal-rank-fusion constant used to merge keyword and semantic rankings
 
 
@@ -171,6 +172,63 @@ def reciprocal_rank_fusion(rankings, k=RRF_K):
     return [first[key] for key in sorted(scores, key=lambda key: -scores[key])]
 
 
+_MODEL_CACHE = {}
+
+
+def _load_cross_encoder(model_name):
+    """One loaded cross-encoder per model name, shared by every upload in this process."""
+    if model_name not in _MODEL_CACHE:
+        from sentence_transformers import CrossEncoder
+        _MODEL_CACHE[model_name] = CrossEncoder(model_name).predict
+    return _MODEL_CACHE[model_name]
+
+
+class CrossEncoderReranker:
+    """Re-scores (question, chunk) pairs with a local cross-encoder and sorts best first (R12).
+
+    The model loads on first use and is shared across uploads, so importing this module stays fast
+    and it is downloaded once from Hugging Face. A retrieval aid must not break the app: if the
+    model cannot load (offline on a first run, say) reranking is switched off for this retriever
+    with one warning; if one scoring call fails or returns unusable scores, only that call keeps the
+    earlier order. `scorer` lets tests supply a function from (question, text) pairs to scores.
+    """
+
+    def __init__(self, model_name=None, scorer=None):
+        self.model_name = model_name or RERANKER_MODEL
+        self._scorer = scorer
+        self._failed = False
+
+    @property
+    def unavailable(self):
+        """True once the model failed to load, so callers can tell a real rerank from a fallback."""
+        return self._failed
+
+    def _load(self):
+        if self._scorer is None:
+            self._scorer = _load_cross_encoder(self.model_name)
+        return self._scorer
+
+    def __call__(self, question, docs):
+        docs = list(docs)
+        if len(docs) < 2 or self._failed:
+            return docs
+        try:
+            scorer = self._load()
+        except Exception as error:
+            self._failed = True
+            print(f"Reranker unavailable ({error}); keeping the earlier order.")
+            return docs
+        try:
+            scores = [float(score) for score in scorer([(question, doc.page_content) for doc in docs])]
+            if len(scores) != len(docs) or any(score != score for score in scores):
+                raise ValueError(f"expected {len(docs)} usable scores, got {scores!r}")
+        except Exception as error:
+            print(f"Reranking failed for this question ({error}); keeping the earlier order.")
+            return docs
+        order = sorted(range(len(docs)), key=lambda i: -scores[i])
+        return [docs[i] for i in order]
+
+
 class ComposedRetriever(BaseRetriever):
     """The one retriever the graph sees (AD-9): invoke(question) returns chunks in final order.
 
@@ -184,12 +242,14 @@ class ComposedRetriever(BaseRetriever):
 
     semantic_search: Callable[[str], list]
     keyword_search: Optional[Callable[[str], list]] = None
+    reranker: Optional[Callable[[str, list], list]] = None
     final_k: int = FINAL_K
     dedup_threshold: float = DEDUP_THRESHOLD
 
-    def __init__(self, semantic_search, keyword_search=None, final_k=FINAL_K, dedup_threshold=DEDUP_THRESHOLD):
+    def __init__(self, semantic_search, keyword_search=None, reranker=None,
+                 final_k=FINAL_K, dedup_threshold=DEDUP_THRESHOLD):
         super().__init__(
-            semantic_search=semantic_search, keyword_search=keyword_search,
+            semantic_search=semantic_search, keyword_search=keyword_search, reranker=reranker,
             final_k=final_k, dedup_threshold=dedup_threshold,
         )
 
@@ -201,15 +261,21 @@ class ComposedRetriever(BaseRetriever):
 
     def _get_relevant_documents(self, query, *, run_manager=None):
         candidates = remove_near_duplicates(self.candidates(query), self.dedup_threshold)
+        if self.reranker is not None:
+            candidates = self.reranker(query, candidates)
         return candidates[: self.final_k]
 
 
-def make_retriever(vector_store, chunks=None):
-    """The retriever bound to one upload's store; with chunks it also searches them by keyword."""
+def make_retriever(vector_store, chunks=None, reranker=None):
+    """The retriever bound to one upload's store.
+
+    With chunks it also searches them by keyword; with a reranker it re-orders the candidates.
+    """
     keyword_search = KeywordIndex(chunks).search if chunks else None
     return ComposedRetriever(
         lambda question: vector_store.similarity_search(question, k=CANDIDATE_K),
         keyword_search=keyword_search,
+        reranker=reranker,
     )
 
 
@@ -433,7 +499,7 @@ def process_document_and_create_vdb(uploaded_file):
         vector_store = build_vector_store(final_chunks, embeddings)
 
         return (
-            make_retriever(vector_store, final_chunks),
+            make_retriever(vector_store, final_chunks, CrossEncoderReranker()),
             final_chunks,
             vector_store
         )

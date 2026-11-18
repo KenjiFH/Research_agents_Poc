@@ -1,9 +1,11 @@
+import sys
 import unittest
+from unittest import mock
 
 from langchain_core.documents import Document
 
 from document_processor import (
-    CANDIDATE_K, ComposedRetriever, FINAL_K, KeywordIndex, make_retriever, reciprocal_rank_fusion, remove_near_duplicates, tokenize,
+    CANDIDATE_K, ComposedRetriever, CrossEncoderReranker, FINAL_K, KeywordIndex, make_retriever, reciprocal_rank_fusion, remove_near_duplicates, tokenize,
 )
 
 
@@ -175,6 +177,106 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertIn("c3", [d.metadata["chunk_id"] for d in retriever.invoke("error 429")][:2])
         self.assertEqual(asked["k"], CANDIDATE_K)  # the larger candidate set is really requested
         self.assertIsNone(make_retriever(Store()).keyword_search)
+
+
+class RerankerTests(unittest.TestCase):
+    DOCS = [doc("c1", "first"), doc("c2", "second"), doc("c3", "third")]
+
+    def test_documents_are_sorted_by_score_best_first(self):
+        reranker = CrossEncoderReranker(scorer=lambda pairs: [0.1, 0.9, 0.5])
+        self.assertEqual([d.metadata["chunk_id"] for d in reranker("q", self.DOCS)], ["c2", "c3", "c1"])
+
+    def test_the_scorer_receives_question_text_pairs(self):
+        seen = {}
+        CrossEncoderReranker(scorer=lambda pairs: seen.setdefault("pairs", pairs) and [1, 2, 3])("my question", self.DOCS)
+        self.assertEqual(seen["pairs"], [("my question", "first"), ("my question", "second"), ("my question", "third")])
+
+    def test_metadata_and_page_survive_reranking(self):
+        reranked = CrossEncoderReranker(scorer=lambda pairs: [3, 2, 1])("q", [doc("c7", "a", 4), doc("c8", "b", 9)])
+        self.assertEqual([(d.metadata["chunk_id"], d.metadata["page_no"]) for d in reranked], [("c7", 4), ("c8", 9)])
+
+    def test_a_scoring_failure_keeps_the_order_for_that_call_only(self):
+        outcomes = iter([OSError("out of memory"), [0.1, 0.9, 0.5]])
+
+        def flaky(pairs):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+        reranker = CrossEncoderReranker(scorer=flaky)
+        self.assertEqual([d.metadata["chunk_id"] for d in reranker("q", self.DOCS)], ["c1", "c2", "c3"])
+        self.assertEqual([d.metadata["chunk_id"] for d in reranker("q", self.DOCS)], ["c2", "c3", "c1"])
+        self.assertFalse(reranker.unavailable)
+
+    def test_unusable_scores_keep_the_earlier_order_instead_of_breaking_retrieval(self):
+        for bad in ([0.5], [None, 1, 2], [float("nan"), 1, 2], "oops"):
+            reranker = CrossEncoderReranker(scorer=lambda pairs, bad=bad: bad)
+            self.assertEqual([d.metadata["chunk_id"] for d in reranker("q", self.DOCS)], ["c1", "c2", "c3"], bad)
+
+    def test_a_model_that_cannot_load_switches_reranking_off_with_one_attempt(self):
+        import document_processor as dp
+        attempts = []
+
+        def failing_loader(name):
+            attempts.append(name)
+            raise OSError("no network")
+        reranker = CrossEncoderReranker(model_name="missing-model")
+        with mock.patch.object(dp, "_load_cross_encoder", failing_loader):
+            self.assertEqual(len(reranker("q", self.DOCS)), 3)
+            reranker("q", self.DOCS)
+        self.assertEqual(attempts, ["missing-model"])
+        self.assertTrue(reranker.unavailable)
+
+    def test_the_loaded_model_is_shared_across_reranker_instances(self):
+        import document_processor as dp
+        loaded = []
+
+        class FakeCrossEncoder:
+            def __init__(self, name):
+                loaded.append(name)
+
+            def predict(self, pairs):
+                return [1.0] * len(pairs)
+        fake_module = mock.MagicMock(CrossEncoder=FakeCrossEncoder)
+        with mock.patch.dict(sys.modules, {"sentence_transformers": fake_module}), \
+             mock.patch.dict(dp._MODEL_CACHE, clear=True):
+            CrossEncoderReranker(model_name="shared-model")("q", self.DOCS)
+            CrossEncoderReranker(model_name="shared-model")("q", self.DOCS)
+        self.assertEqual(loaded, ["shared-model"])
+
+    def test_fewer_than_two_documents_are_returned_untouched(self):
+        reranker = CrossEncoderReranker(scorer=lambda pairs: self.fail("should not score"))
+        self.assertEqual(reranker("q", self.DOCS[:1]), self.DOCS[:1])
+        self.assertEqual(reranker("q", []), [])
+
+    def test_the_model_is_not_loaded_until_first_use(self):
+        reranker = CrossEncoderReranker(model_name="does-not-exist")
+        self.assertIsNone(reranker._scorer)
+
+
+class RerankedRetrieverTests(unittest.TestCase):
+    def test_reranking_can_promote_a_chunk_from_beyond_the_final_cut(self):
+        docs = [doc(f"c{i}", f"distinct passage number {i} with its own unique words u{i} v{i} w{i}") for i in range(1, 15)]
+        promote_last = lambda q, ds: sorted(ds, key=lambda d: d.metadata["chunk_id"] != "c14")
+        plain = ComposedRetriever(lambda q: docs).invoke("q")
+        reranked = ComposedRetriever(lambda q: docs, reranker=promote_last).invoke("q")
+        self.assertNotIn("c14", [d.metadata["chunk_id"] for d in plain])
+        self.assertEqual(reranked[0].metadata["chunk_id"], "c14")
+        self.assertEqual(len(reranked), FINAL_K)
+
+    def test_reranking_runs_after_dedup(self):
+        seen = {}
+        dup = doc("c2", "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu again")
+        original = doc("c1", "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu")
+        ComposedRetriever(lambda q: [original, dup], reranker=lambda q, ds: seen.setdefault("n", len(ds)) and ds).invoke("q")
+        self.assertEqual(seen["n"], 1)
+
+    def test_make_retriever_passes_the_reranker_through(self):
+        class Store:
+            def similarity_search(self, question, k):
+                return [CORPUS[0]]
+        marker = lambda q, ds: ds
+        self.assertIs(make_retriever(Store(), CORPUS, marker).reranker, marker)
 
 
 if __name__ == "__main__":
