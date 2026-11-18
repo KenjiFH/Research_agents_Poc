@@ -173,7 +173,6 @@ The two `eval` scripts are small, synthetic checks that show direction, not benc
 
 * **The judge is not yet validated against human labels.** That is why the gate is off by default. The example labeled set was written by an assistant and needs to be re-labeled by a person from a real document before it counts. Treat the Pass / Fail verdicts as a signal, not ground truth.
 * **The measurements are small and synthetic.** Check retrieval on your own documents with the retrieved-chunks panel or `RAG_DEBUG`.
-* **BM25 is not yet shown to help on real documents.** It added nothing on the synthetic test, where the larger candidate set already found every answer. It is built for exact terms that a semantic search ranks too low, and on very small uploads its weights are not meaningful.
 * **LangSmith feedback has been unit-tested but not yet confirmed on a live trace.**
 * **Single document, single user.** Each upload replaces the last, and nothing is persisted.
 * **Scanned or unusual layouts depend on Docling's output.** Check the chunking report if answers seem to miss.
