@@ -1,4 +1,6 @@
+import re
 import tempfile
+from typing import Callable, Optional
 import os
 import uuid
 import pandas as pd
@@ -6,13 +8,20 @@ from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling.datamodel.base_models import InputFormat
 from docling.datamodel.pipeline_options import PdfPipelineOptions
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from pydantic import ConfigDict
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
+from rank_bm25 import BM25Okapi
 from langchain_ollama import OllamaEmbeddings
 
 # Using our local Ollama embedding model
 EMBEDDING_MODEL = "nomic-embed-text"
-RETRIEVER_K = 4
+# Retrieval (AD-9): draw many candidates, drop near-duplicates, hand the best few to the answerer
+CANDIDATE_K = 20       # candidates drawn from each search before filtering
+FINAL_K = 6            # chunks the answerer receives
+DEDUP_THRESHOLD = 0.6  # word-shingle containment at or above this counts as a near-duplicate
+RRF_K = 60             # reciprocal-rank-fusion constant used to merge keyword and semantic rankings
 
 
 def extract_safe_text(obj, default=""):
@@ -77,9 +86,131 @@ def build_vector_store(chunks, embeddings):
     )
 
 
-def make_retriever(vector_store):
-    """The retriever bound to one upload's store."""
-    return vector_store.as_retriever(search_kwargs={"k": RETRIEVER_K})
+def _shingles(text, size=4):
+    """Lower-cased word shingles of a text, used to compare chunks for near-duplication."""
+    words = re.findall(r"\w+", text.lower())
+    if not words:
+        return set()
+    if len(words) <= size:
+        return {" ".join(words)}
+    return {" ".join(words[i:i + size]) for i in range(len(words) - size + 1)}
+
+
+def remove_near_duplicates(docs, threshold=DEDUP_THRESHOLD):
+    """Drop a chunk that mostly repeats an earlier, better-ranked one (overlap, boilerplate, repeats).
+
+    A chunk is dropped when at least `threshold` of its own word shingles already appear in one
+    kept chunk. A longer chunk that merely contains an earlier short one (a repeated header, say)
+    stays, because most of its text is new. The first chunk always stays, and so does a chunk with
+    no words, since there is nothing to compare.
+    """
+    kept, kept_shingles = [], []
+    for doc in docs:
+        shingles = _shingles(doc.page_content)
+        duplicate = bool(shingles) and any(
+            len(shingles & other) / len(shingles) >= threshold for other in kept_shingles
+        )
+        if not duplicate:
+            kept.append(doc)
+            kept_shingles.append(shingles)
+    return kept
+
+
+COMPOUND = re.compile(r"\w+(?:[.,\-/]\w+)+")
+WORD = re.compile(r"\w+")
+
+
+def tokenize(text):
+    """Lower-cased tokens for keyword search.
+
+    Compounds such as '4.2', 'abc-123' or '1,200' are kept whole and also split into their parts,
+    so an exact section number or code matches precisely and a partial query still matches.
+    """
+    text = text.lower()
+    tokens = []
+    for compound in COMPOUND.findall(text):
+        tokens.append(compound)
+    tokens.extend(WORD.findall(text))
+    return tokens
+
+
+class KeywordIndex:
+    """BM25 keyword search over one upload's chunks, so exact terms are found (R11)."""
+
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+        corpus = [tokenize(chunk.page_content) for chunk in self.chunks]
+        self.token_sets = [set(tokens) for tokens in corpus]
+        self.bm25 = BM25Okapi(corpus) if any(corpus) else None
+
+    def search(self, question, k=CANDIDATE_K):
+        """Chunks sharing at least one term with the question, best BM25 score first.
+
+        Membership is decided by term overlap, not by the score sign: Okapi idf is zero or
+        negative for terms found in half the chunks or more, which would hide hits in small uploads.
+        """
+        tokens = set(tokenize(question))
+        if self.bm25 is None or not tokens:
+            return []
+        scores = self.bm25.get_scores(list(tokens))
+        ranked = sorted(range(len(self.chunks)), key=lambda i: -scores[i])
+        return [self.chunks[i] for i in ranked if tokens & self.token_sets[i]][:k]
+
+
+def reciprocal_rank_fusion(rankings, k=RRF_K):
+    """Merge ranked lists of chunks: each list adds 1 / (k + rank) to a chunk's score.
+
+    Chunks are identified by chunk_id; ties keep the order of the earlier list.
+    """
+    scores, first = {}, {}
+    for ranking in rankings:
+        for rank, doc in enumerate(ranking, start=1):
+            key = doc.metadata.get("chunk_id") or doc.page_content
+            scores[key] = scores.get(key, 0) + 1 / (k + rank)
+            first.setdefault(key, doc)
+    return [first[key] for key in sorted(scores, key=lambda key: -scores[key])]
+
+
+class ComposedRetriever(BaseRetriever):
+    """The one retriever the graph sees (AD-9): invoke(question) returns chunks in final order.
+
+    A LangChain retriever, so its calls are traced and take callbacks like the one it replaced.
+    Candidate search, de-duplication and any later stage run inside; every stage keeps each
+    chunk's chunk_id and page_no. `semantic_search` and the optional `keyword_search` each map a
+    question to a ranked list of documents; when both are given their rankings are fused.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    semantic_search: Callable[[str], list]
+    keyword_search: Optional[Callable[[str], list]] = None
+    final_k: int = FINAL_K
+    dedup_threshold: float = DEDUP_THRESHOLD
+
+    def __init__(self, semantic_search, keyword_search=None, final_k=FINAL_K, dedup_threshold=DEDUP_THRESHOLD):
+        super().__init__(
+            semantic_search=semantic_search, keyword_search=keyword_search,
+            final_k=final_k, dedup_threshold=dedup_threshold,
+        )
+
+    def candidates(self, question):
+        semantic = list(self.semantic_search(question))
+        if self.keyword_search is None:
+            return semantic
+        return reciprocal_rank_fusion([semantic, list(self.keyword_search(question))])
+
+    def _get_relevant_documents(self, query, *, run_manager=None):
+        candidates = remove_near_duplicates(self.candidates(query), self.dedup_threshold)
+        return candidates[: self.final_k]
+
+
+def make_retriever(vector_store, chunks=None):
+    """The retriever bound to one upload's store; with chunks it also searches them by keyword."""
+    keyword_search = KeywordIndex(chunks).search if chunks else None
+    return ComposedRetriever(
+        lambda question: vector_store.similarity_search(question, k=CANDIDATE_K),
+        keyword_search=keyword_search,
+    )
 
 
 def delete_vector_store(vector_store):
@@ -302,7 +433,7 @@ def process_document_and_create_vdb(uploaded_file):
         vector_store = build_vector_store(final_chunks, embeddings)
 
         return (
-            make_retriever(vector_store),
+            make_retriever(vector_store, final_chunks),
             final_chunks,
             vector_store
         )

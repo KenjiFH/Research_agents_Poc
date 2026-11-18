@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from document_processor import RETRIEVER_K, build_vector_store, delete_vector_store, items_to_raw_documents, make_retriever
+from document_processor import FINAL_K, build_vector_store, delete_vector_store, items_to_raw_documents, make_retriever
 from langchain_core.documents import Document
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
@@ -78,15 +78,13 @@ class MoreItemsTests(unittest.TestCase):
 
 
 class RetrieverBindingTests(unittest.TestCase):
-    def test_default_retriever_uses_k_and_only_its_own_collection(self):
+    def test_retriever_is_bound_to_its_own_collection_and_returns_final_k(self):
         emb = DeterministicFakeEmbedding(size=16)
-        a = build_vector_store([Document(page_content=f"ALPHA {i}", metadata={"type": "text", "page_no": 1}) for i in range(6)], emb)
-        b = build_vector_store([Document(page_content=f"BETA {i}", metadata={"type": "text", "page_no": 1}) for i in range(6)], emb)
+        a = build_vector_store([Document(page_content=f"ALPHA {i}", metadata={"type": "text", "page_no": 1}) for i in range(10)], emb)
+        b = build_vector_store([Document(page_content=f"BETA {i}", metadata={"type": "text", "page_no": 1}) for i in range(10)], emb)
         try:
-            retriever = make_retriever(b)
-            self.assertEqual(retriever.search_kwargs["k"], RETRIEVER_K)
-            docs = retriever.invoke("ALPHA 1")
-            self.assertEqual(len(docs), RETRIEVER_K)
+            docs = make_retriever(b).invoke("ALPHA 1")
+            self.assertEqual(len(docs), FINAL_K)
             self.assertTrue(all(d.page_content.startswith("BETA") for d in docs))
         finally:
             delete_vector_store(a)
