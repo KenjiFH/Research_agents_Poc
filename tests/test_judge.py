@@ -1,6 +1,8 @@
 import unittest
 from unittest import mock
 
+import ollama
+
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 
 import agents
@@ -27,6 +29,19 @@ class JudgeTests(unittest.TestCase):
             self.assertIn("self-grading", agents.get_judge_warning())
         with mock.patch.object(agents, "JUDGE_MODEL", "some-other-model"):
             self.assertIsNone(agents.get_judge_warning())
+
+    def test_unpulled_judge_model_raises_a_friendly_error(self):
+        with mock.patch.object(agents, "load_evaluator") as load:
+            load.return_value.evaluate_strings.side_effect = ollama.ResponseError("model not found", 404)
+            with self.assertRaises(agents.JudgeModelNotFound) as caught:
+                agents.judge("q", "a", "c")
+        self.assertIn("ollama pull", str(caught.exception))
+
+    def test_other_ollama_errors_are_not_swallowed(self):
+        with mock.patch.object(agents, "load_evaluator") as load:
+            load.return_value.evaluate_strings.side_effect = ollama.ResponseError("boom", 500)
+            with self.assertRaises(ollama.ResponseError):
+                agents.judge("q", "a", "c")
 
     def test_equal_models_are_detected_despite_case_and_latest_tag(self):
         for variant in ("llama3:latest", "Llama3", " llama3 "):

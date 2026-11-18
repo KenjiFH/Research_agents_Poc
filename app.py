@@ -6,7 +6,7 @@ load_dotenv()
 import streamlit as st
 from document_processor import process_document_and_create_vdb, delete_vector_store
 from session_logic import upload_action
-from agents import create_multi_agent_workflow, get_judge_warning
+from agents import create_multi_agent_workflow, get_judge_warning, JudgeModelNotFound
 
 st.set_page_config(page_title="Multi-Agent RAG POC", page_icon="🤖", layout="centered")
 st.title("🤖 Multi-Agent RAG Assistant")
@@ -117,13 +117,18 @@ if prompt := st.chat_input("Ask a question about your document..."):
                 initial_state = {
                     "question": prompt, 
                     "context": "", 
+                    "retrieved_chunks": [],
                     "answer": "", 
-
+                    "citations": [],
                     "faithfulness_score": 0, 
                     "relevance_score": 0
                 }
                 
-                final_state = st.session_state.workflow.invoke(initial_state)
+                try:
+                    final_state = st.session_state.workflow.invoke(initial_state)
+                except JudgeModelNotFound as error:
+                    st.error(str(error))
+                    st.stop()
                 
                 response = final_state["answer"]
                 f_score = final_state["faithfulness_score"]

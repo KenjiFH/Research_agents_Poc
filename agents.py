@@ -9,6 +9,7 @@ ls_client = Client()
 import json
 import os
 import warnings
+import ollama
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
@@ -36,6 +37,10 @@ def _same_model(a, b):
         name = name.strip().lower()
         return name[: -len(":latest")] if name.endswith(":latest") else name
     return normalize(a) == normalize(b)
+
+
+class JudgeModelNotFound(RuntimeError):
+    """The configured judge model is not available in Ollama."""
 
 
 def get_judge_warning():
@@ -72,10 +77,18 @@ def judge(question, answer, context, llm=None):
         llm=llm,
     )
 
-    f_eval = faithfulness_evaluator.evaluate_strings(
-        prediction=answer, input=question, reference=context
-    )
-    r_eval = relevance_evaluator.evaluate_strings(prediction=answer, input=question)
+    try:
+        f_eval = faithfulness_evaluator.evaluate_strings(
+            prediction=answer, input=question, reference=context
+        )
+        r_eval = relevance_evaluator.evaluate_strings(prediction=answer, input=question)
+    except ollama.ResponseError as error:
+        if getattr(error, "status_code", None) == 404:
+            raise JudgeModelNotFound(
+                f"Judge model '{JUDGE_MODEL}' is not available in Ollama. "
+                f"Run: ollama pull {JUDGE_MODEL}"
+            ) from error
+        raise
 
     def to_percent(raw):
         return None if raw is None else raw * 100
@@ -87,11 +100,60 @@ def judge(question, answer, context, llm=None):
         "relevance_reasoning": r_eval.get("reasoning"),
     }
 
+def format_context(docs):
+    """Number retrieved chunks by chunk_id so the synthesizer can cite them (AD-5).
+
+    Returns (context_text, retrieved_chunks) where retrieved_chunks is a list of
+    {"chunk_id", "page_no", "content"} used later to resolve and verify citations.
+    """
+    retrieved = []
+    blocks = []
+    for position, doc in enumerate(docs, start=1):
+        # Fallback ids use an "r" prefix so they can never collide with real "c<n>" ids
+        chunk_id = doc.metadata.get("chunk_id") or f"r{position}"
+        page_no = doc.metadata.get("page_no")
+        retrieved.append({"chunk_id": chunk_id, "page_no": page_no, "content": doc.page_content})
+        page_label = f" (page {page_no})" if page_no is not None else ""
+        blocks.append(f"[{chunk_id}]{page_label}\n{doc.page_content}")
+    return "\n\n---\n\n".join(blocks), retrieved
+
+
+def parse_synthesis(raw_text, retrieved_chunks):
+    """Split the synthesizer's JSON reply into (answer, citations).
+
+    Each citation is {"chunk_id", "page_no", "quote"}; the page comes from the retrieved chunk,
+    never from the model. Citations naming an unknown chunk are dropped. A reply that is not the
+    expected JSON is kept as a plain answer with no citations.
+    """
+    pages = {chunk["chunk_id"]: chunk["page_no"] for chunk in retrieved_chunks}
+    try:
+        data = json.loads(raw_text)
+    except (TypeError, ValueError):
+        data = None
+    if not isinstance(data, dict):
+        return str(raw_text).strip(), []
+    if not str(data.get("answer") or "").strip():
+        # Valid JSON but no answer text: never show raw JSON to the user
+        return "I do not know.", []
+
+    citations = []
+    for entry in data.get("citations") or []:
+        if not isinstance(entry, dict):
+            continue
+        chunk_id = str(entry.get("chunk_id") or "").strip()
+        quote = str(entry.get("quote") or "").strip()
+        if chunk_id in pages and quote:
+            citations.append({"chunk_id": chunk_id, "page_no": pages[chunk_id], "quote": quote})
+    return str(data["answer"]).strip(), citations
+
+
 # 1. Updated Graph State
 class RAGState(TypedDict):
     question: str
     context: str
+    retrieved_chunks: list   # [{chunk_id, page_no, content}] behind the numbered context
     answer: str
+    citations: list          # [{chunk_id, page_no, quote}]
     faithfulness_score: int  # New: Did it use only the context?
     relevance_score: int     # New: Did it answer the prompt?
 
@@ -99,6 +161,8 @@ def create_multi_agent_workflow(retriever):
     # We use format="json" for the evaluator to ensure we get a parseable response
     llm = ChatOllama(model=LLM_MODEL, temperature=0.2)
     llm_json = ChatOllama(model=LLM_MODEL, temperature=0.0, format="json")
+    # The synthesizer replies in JSON so it can return citations with its answer
+    synth_llm = ChatOllama(model=LLM_MODEL, temperature=0.2, format="json")
 
     # ==========================================
     # Agent 1: The Researcher
@@ -106,8 +170,8 @@ def create_multi_agent_workflow(retriever):
     def researcher_node(state: RAGState):
         print("--- RESEARCHER: Searching Vector DB ---")
         docs = retriever.invoke(state["question"])
-        formatted_context = "\n\n---\n\n".join([doc.page_content for doc in docs])
-        return {"context": formatted_context}
+        formatted_context, retrieved_chunks = format_context(docs)
+        return {"context": formatted_context, "retrieved_chunks": retrieved_chunks}
 
     # ==========================================
     # Agent 2: The Synthesizer
@@ -117,14 +181,20 @@ def create_multi_agent_workflow(retriever):
         prompt = ChatPromptTemplate.from_template(
             "You are a helpful and precise assistant. Answer the user's question "
             "based ONLY on the provided context. If the answer is not in the context, "
-            "state that you do not know.\n\n"
+            "state that you do not know and return no citations.\n\n"
+            "Each context passage starts with its id in square brackets, like [c3].\n"
+            "Reply with JSON only, in exactly this shape:\n"
+            '{{"answer": "<your answer>", "citations": '
+            '[{{"chunk_id": "<id of a passage you used>", "quote": "<words copied exactly from that passage>"}}]}}\n'
+            "Copy each quote verbatim from the passage; never paraphrase it.\n\n"
             "Context:\n{context}\n\n"
             "Question: {question}\n\n"
-            "Answer:"
+            "JSON:"
         )
-        chain = prompt | llm
+        chain = prompt | synth_llm
         response = chain.invoke({"context": state["context"], "question": state["question"]})
-        return {"answer": response.content}
+        answer, citations = parse_synthesis(response.content, state.get("retrieved_chunks", []))
+        return {"answer": answer, "citations": citations}
 
     # ==========================================
     # Agent 3: The Evaluator (NEW)
