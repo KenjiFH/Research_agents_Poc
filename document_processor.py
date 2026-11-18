@@ -43,6 +43,24 @@ def extract_safe_text(obj, default=""):
         return str(obj)
 
 
+def get_page_no(item, default=None):
+    """Return the 1-based page number of a Docling item, or default if it has none."""
+    for prov in getattr(item, "prov", None) or []:
+        page_no = getattr(prov, "page_no", None)
+        if isinstance(page_no, int):
+            return page_no
+    return default
+
+
+def tag_chunks(chunks):
+    """Give every chunk a stable, ordered chunk_id (c1, c2, ...) and a 1-based page_no (default 1)."""
+    for index, chunk in enumerate(chunks, start=1):
+        chunk.metadata["chunk_id"] = f"c{index}"
+        if not isinstance(chunk.metadata.get("page_no"), int):
+            chunk.metadata["page_no"] = 1
+    return chunks
+
+
 def process_document_and_create_vdb(uploaded_file):
     """
     Takes a Streamlit UploadedFile, processes it with Docling (OCR enabled),
@@ -74,11 +92,15 @@ def process_document_and_create_vdb(uploaded_file):
 
         raw_documents = []
         current_text_buffer = ""
+        buffer_page = 1  # page the buffered text started on
+        last_page = 1  # last page seen; page-less items inherit it so page_no is always an int
         last_seen_text = "Untitled Document Element"
 
         # 3. Iterate through elements in strict reading order
         for item, level in result.document.iterate_items():
             item_label = getattr(item, "label", "")
+            item_page = get_page_no(item, default=last_page)
+            last_page = item_page
 
             # --- INTERCEPT TABLES ---
             if item_label == "table":
@@ -91,7 +113,7 @@ def process_document_and_create_vdb(uploaded_file):
                     raw_documents.append(
                         Document(
                             page_content=current_text_buffer.strip(),
-                            metadata={"type": "text"}
+                            metadata={"type": "text", "page_no": buffer_page}
                         )
                     )
                     current_text_buffer = ""
@@ -125,7 +147,8 @@ def process_document_and_create_vdb(uploaded_file):
                         page_content=enriched_table_text,
                         metadata={
                             "type": "table",
-                            "title": caption
+                            "title": caption,
+                            "page_no": item_page
                         }
                     )
                 )
@@ -139,7 +162,7 @@ def process_document_and_create_vdb(uploaded_file):
                     raw_documents.append(
                         Document(
                             page_content=current_text_buffer.strip(),
-                            metadata={"type": "text"}
+                            metadata={"type": "text", "page_no": buffer_page}
                         )
                     )
                     current_text_buffer = ""
@@ -172,7 +195,8 @@ def process_document_and_create_vdb(uploaded_file):
                         metadata={
                             "type": "image",
                             "title": caption,
-                            "source_element": "picture"
+                            "source_element": "picture",
+                            "page_no": item_page
                         }
                     )
                 )
@@ -182,6 +206,18 @@ def process_document_and_create_vdb(uploaded_file):
                 text = extract_safe_text(item)
 
                 if text:
+                    # Never let one text chunk span two pages, so page_no stays exact
+                    if current_text_buffer.strip() and item_page != buffer_page:
+                        raw_documents.append(
+                            Document(
+                                page_content=current_text_buffer.strip(),
+                                metadata={"type": "text", "page_no": buffer_page}
+                            )
+                        )
+                        current_text_buffer = ""
+
+                    if not current_text_buffer.strip():
+                        buffer_page = item_page
                     current_text_buffer += text + "\n\n"
                     
                     # HEURISTIC FIX: Only update last_seen_text if the chunk is meaningful
@@ -197,7 +233,7 @@ def process_document_and_create_vdb(uploaded_file):
             raw_documents.append(
                 Document(
                     page_content=current_text_buffer.strip(),
-                    metadata={"type": "text"}
+                    metadata={"type": "text", "page_no": buffer_page}
                 )
             )
 
@@ -216,6 +252,8 @@ def process_document_and_create_vdb(uploaded_file):
             else:
                 split_docs = text_splitter.split_documents([doc])
                 final_chunks.extend(split_docs)
+
+        tag_chunks(final_chunks)
 
         print(f"Pipeline yielded {len(final_chunks)} context-aware chunks.")
 
