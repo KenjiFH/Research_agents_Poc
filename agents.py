@@ -73,6 +73,26 @@ SYNTHESIS_PROMPT = (
 )
 
 
+def _read_seed(default=7):
+    """MODEL_SEED from the environment; anything that is not a whole number falls back to the default."""
+    try:
+        return int(os.getenv("MODEL_SEED", "").strip())
+    except ValueError:
+        return default
+
+
+# Random sampling is switched off for every model call: temperature 0 picks the most likely token
+# each time, and a fixed seed pins whatever randomness remains. The same prompt then gives the same
+# answer and the same grade (for the same model, hardware and Ollama version). Change MODEL_SEED to
+# get a different but still repeatable result.
+MODEL_SEED = _read_seed()
+
+
+def model_options():
+    """Sampling settings shared by the answering model and the judge."""
+    return {"temperature": 0.0, "seed": MODEL_SEED}
+
+
 def _same_model(a, b):
     """Ollama treats 'llama3' and 'llama3:latest' as one model; compare case-insensitively."""
     def normalize(name):
@@ -144,7 +164,7 @@ def judge(question, answer, context, llm=None):
     metric is "pass", "fail" or "error" (the evaluator gave no usable score).
     """
     if llm is None:
-        llm = ChatOllama(model=JUDGE_MODEL, temperature=0.0)
+        llm = ChatOllama(model=JUDGE_MODEL, **model_options())
 
     faithfulness_evaluator = load_evaluator(
         "labeled_criteria",
@@ -263,11 +283,8 @@ class RAGState(TypedDict):
     gate: str                # "retry" | "abstain" | "end": decided once, by the evaluator (AD-1)
 
 def create_multi_agent_workflow(retriever):
-    # We use format="json" for the evaluator to ensure we get a parseable response
-    llm = ChatOllama(model=ANSWER_MODEL, temperature=0.2)
-    llm_json = ChatOllama(model=ANSWER_MODEL, temperature=0.0, format="json")
     # The synthesizer replies in a schema-constrained structure so it can return citations with its answer
-    synth_llm = ChatOllama(model=ANSWER_MODEL, temperature=0.2, format=SYNTHESIS_SCHEMA)
+    synth_llm = ChatOllama(model=ANSWER_MODEL, format=SYNTHESIS_SCHEMA, **model_options())
 
     # ==========================================
     # Agent 1: The Researcher

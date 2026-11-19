@@ -162,6 +162,7 @@ version, and the app failed on start with
 | A failed workflow build leaked its Chroma collection | Reviewer of story 1.2 | The store is saved before the workflow is built, and cleanup keys on the store |
 | An unparseable score looked like an unfaithful answer | Design of the tri-state verdict | `error` is its own verdict and never retries or abstains |
 | A withheld answer still showed a relevance grade | Reviewer of the gate | After abstaining, relevance is cleared and LangSmith gets only the faithfulness fail |
+| The same question gave different answers and different relevance grades | Measured with real models: retrieval was identical across five runs, the answer text varied (temperature 0.2 gave three wordings in five runs) and the judge was stable on a fixed answer, so the grade followed the wording | Temperature 0 and a fixed seed (`MODEL_SEED`) on the answering model and the judge; the two unused model clients were removed; caching is a separate, later step |
 | `llama3:latest` or `Llama3` would self-grade with no warning | Reviewer of story 3.1 | Model names are compared with the `:latest` tag and case normalized |
 
 ## Developer insight in the terminal

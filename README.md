@@ -63,6 +63,7 @@ The graph is a deterministic LangGraph state machine. A model never chooses the 
 * **Document intelligence:** IBM Docling extracts tables and figures as isolated chunks that keep their page numbers and a preceding-context blurb, so they stay searchable instead of being diluted into surrounding text. Text is never split across a page.
 * **Hybrid retrieval:** semantic and BM25 results are fused by reciprocal rank, near-duplicates are removed, and a local cross-encoder reranks the candidates. If the reranker cannot load, retrieval keeps its earlier order and prints a warning rather than failing.
 * **Grounded answers:** the answerer replies in a schema-constrained structure with complete sentences and citations. Code, not the model, adds each page number and rejects any quote that is not verbatim text of the chunk it names.
+* **Repeatable results:** random sampling is switched off for both the answering model and the judge, so asking the same question twice gives the same answer and the same Pass / Fail / Error.
 * **Automated QA:** `CriteriaEvalChain` grades *faithfulness* (is the answer supported by the retrieved text?) and *relevance* (does it answer the question?). A judge failure shows as Error, never as a silent fail.
 * **Observability:** LangSmith traces node execution and receives the same pass or fail verdicts the interface shows (an Error sends nothing).
 * **Transparency:** a "Retrieved chunks" panel under each answer, and console tools for the developer (below).
@@ -121,6 +122,7 @@ ANSWER_MODEL=llama3
 JUDGE_MODEL=qwen2.5:14b
 RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
 GATE_ENABLED=false
+MODEL_SEED=7
 RAG_DEBUG=0
 ```
 
@@ -130,6 +132,7 @@ RAG_DEBUG=0
 | `JUDGE_MODEL` | The Ollama model that grades them. It should differ from `ANSWER_MODEL`; the app shows a warning if they match, because a model grading its own work is biased |
 | `RERANKER_MODEL` | The Hugging Face cross-encoder used for reranking |
 | `GATE_ENABLED` | `true` turns on the retry-then-abstain gate on failed faithfulness checks |
+| `MODEL_SEED` | Seed for the answering and judge models. Sampling is switched off (temperature 0), so the same question on the same document gives the same answer and the same grades; change the seed for a different but still repeatable result. Repeatability holds for the same model, hardware and Ollama version |
 | `RAG_DEBUG` | `1` prints chunking reports and per-question retrieval traces to the console |
 
 ## Developer tools

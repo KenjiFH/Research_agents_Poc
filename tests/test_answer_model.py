@@ -44,6 +44,48 @@ class SynthesisSchemaTests(unittest.TestCase):
         self.assertIn("complete sentence", schema["properties"]["answer"]["description"])
 
 
+class DeterministicSamplingTests(unittest.TestCase):
+    def test_options_turn_sampling_off_and_pin_a_seed(self):
+        options = agents.model_options()
+        self.assertEqual(options["temperature"], 0.0)
+        self.assertIsInstance(options["seed"], int)
+
+    def test_seed_comes_from_the_environment_and_bad_values_fall_back(self):
+        with mock.patch.dict(os.environ, {"MODEL_SEED": "123"}):
+            self.assertEqual(agents._read_seed(), 123)
+        with mock.patch.dict(os.environ, {"MODEL_SEED": " 5 "}):
+            self.assertEqual(agents._read_seed(), 5)
+        for bad in ("", "abc", "1.5"):
+            with mock.patch.dict(os.environ, {"MODEL_SEED": bad}):
+                self.assertEqual(agents._read_seed(), 7, bad)
+
+    def test_every_model_the_workflow_builds_is_deterministic(self):
+        built = []
+
+        def fake_chat(**kwargs):
+            built.append(kwargs)
+            return RunnableLambda(lambda prompt_value: AIMessage(content="{}"))
+
+        with mock.patch.object(agents, "ChatOllama", side_effect=fake_chat):
+            agents.create_multi_agent_workflow(retriever=None)
+        self.assertTrue(built)
+        for kwargs in built:
+            self.assertEqual(kwargs["temperature"], 0.0, kwargs)
+            self.assertEqual(kwargs["seed"], agents.MODEL_SEED, kwargs)
+
+    def test_the_judge_model_is_deterministic_too(self):
+        with mock.patch.object(agents, "ChatOllama") as chat, mock.patch.object(agents, "load_evaluator") as load:
+            load.return_value.evaluate_strings.return_value = {"score": 1, "reasoning": "r"}
+            agents.judge("q", "a", "c")
+        self.assertEqual(chat.call_args.kwargs["temperature"], 0.0)
+        self.assertEqual(chat.call_args.kwargs["seed"], agents.MODEL_SEED)
+
+    def test_no_model_call_in_agents_sets_its_own_temperature(self):
+        import inspect
+        source = inspect.getsource(agents)
+        self.assertNotIn("temperature=0.2", source)  # the old sampling setting is gone
+
+
 class SchemaAcceptedTests(unittest.TestCase):
     def test_langchain_ollama_accepts_the_schema_as_its_format(self):
         model = agents.ChatOllama(model="any-model", temperature=0.2, format=agents.SYNTHESIS_SCHEMA)
