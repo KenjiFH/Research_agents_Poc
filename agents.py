@@ -11,19 +11,11 @@ import os
 import warnings
 import ollama
 import dev_insight
+import judging
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
-
-#this import was gutted in recent update
-#from langchain.evaluation import load_evaluator 
-
-
-#FOR FUTURE REFERENCE: unresolved imports may just be in langchain_classic.[pkgname]
-
-# so we have to use this
-from langchain_classic.evaluation import load_evaluator
 
 # The model that writes the answer. It is a separate setting from JUDGE_MODEL (AD-4); set
 # ANSWER_MODEL in the environment to change it.
@@ -32,6 +24,18 @@ ANSWER_MODEL = os.getenv("ANSWER_MODEL", "").strip() or "llama3"
 # The judge grades answers and must not be the model that wrote them (AD-4).
 # Override with the JUDGE_MODEL environment variable; pull the model with Ollama first.
 JUDGE_MODEL = os.getenv("JUDGE_MODEL", "").strip() or "qwen2.5:14b"
+# The staged judge prompts carry few-shot examples plus the whole context, which can outgrow
+# Ollama's default 4096-token window, so the judge gets a larger one. Override with JUDGE_NUM_CTX.
+def _read_int(name, default):
+    """An integer setting from the environment; anything that is not a whole number falls back."""
+    try:
+        return int(os.getenv(name, "").strip())
+    except ValueError:
+        return default
+
+
+JUDGE_NUM_CTX = _read_int("JUDGE_NUM_CTX", 8192)
+JUDGE_PROMPT_LIMIT = 0.85  # share of the window a prompt may fill before the judge refuses rather than truncate
 
 
 # The synthesizer's reply is constrained to this schema, so structure comes from the model server
@@ -101,15 +105,6 @@ def _same_model(a, b):
     return normalize(a) == normalize(b)
 
 
-def verdict_from_score(raw):
-    """Map an evaluator's raw score to a verdict: 1 -> pass, 0 -> fail, anything else -> error (AD-3)."""
-    if raw == 1:
-        return "pass"
-    if raw == 0:
-        return "fail"
-    return "error"
-
-
 def tracing_enabled():
     """True when LangSmith tracing is switched on in the environment (as the README's .env does)."""
     for name in ("LANGCHAIN_TRACING_V2", "LANGSMITH_TRACING"):
@@ -157,35 +152,10 @@ def get_judge_warning():
     return None
 
 
-def judge(question, answer, context, llm=None):
-    """Grade one answer for faithfulness and relevance. The only judge implementation (AD-7).
-
-    Returns {"faithfulness", "relevance", "faithfulness_reasoning", "relevance_reasoning"} where each
-    metric is "pass", "fail" or "error" (the evaluator gave no usable score).
-    """
-    if llm is None:
-        llm = ChatOllama(model=JUDGE_MODEL, **model_options())
-
-    faithfulness_evaluator = load_evaluator(
-        "labeled_criteria",
-        criteria={
-            "faithfulness": "Is the submission strictly based on the provided reference context, without introducing any outside information?"
-        },
-        llm=llm,
-    )
-    relevance_evaluator = load_evaluator(
-        "criteria",
-        criteria={
-            "relevance": "Does the submission directly and completely answer the user's input question?"
-        },
-        llm=llm,
-    )
-
+def _ask(llm, prompt):
+    """One model call, with a missing judge model turned into a message that says how to fix it."""
     try:
-        f_eval = faithfulness_evaluator.evaluate_strings(
-            prediction=answer, input=question, reference=context
-        )
-        r_eval = relevance_evaluator.evaluate_strings(prediction=answer, input=question)
+        return llm.invoke(prompt).content
     except ollama.ResponseError as error:
         if getattr(error, "status_code", None) == 404:
             raise JudgeModelNotFound(
@@ -194,12 +164,82 @@ def judge(question, answer, context, llm=None):
             ) from error
         raise
 
+
+def _require_fits_window(prompt):
+    """Refuse a prompt that would fill the judge's window: Ollama would silently drop the start of it,
+    and claims about the lost text would then be wrongly marked unsupported."""
+    estimated = len(prompt) // 4  # rough characters per token
+    if estimated > JUDGE_NUM_CTX * JUDGE_PROMPT_LIMIT:
+        raise judging.JudgeOutputError(
+            f"the judge prompt is about {estimated} tokens, too large for the {JUDGE_NUM_CTX}-token judge window; "
+            "raise JUDGE_NUM_CTX or retrieve less text")
+
+
+def _judge_models(llm):
+    """The model for each stage: the one supplied (tests), else the judge model with that stage's schema."""
+    if llm is not None:
+        return llm, llm, llm
+    return tuple(
+        ChatOllama(model=JUDGE_MODEL, format=schema, num_ctx=JUDGE_NUM_CTX, **model_options())
+        for schema in (judging.CLAIMS_SCHEMA, judging.SUPPORT_SCHEMA, judging.RELEVANCE_SCHEMA)
+    )
+
+
+def judge(question, answer, context, llm=None, citations=None):
+    """Grade one answer for faithfulness and relevance, in stages. The only judge implementation (AD-7).
+
+    0. Quick deterministic checks (judging.precheck): an answer that only declines to answer needs no
+       model; an answer that states a number found nowhere in the context or the question fails
+       faithfulness without the model; names found nowhere in the context become hints.
+    1. The answer is split into separate claims, 2. each claim is checked against the context with a
+       quoted piece of evidence, 3. code verifies each quote is really in the context. The answer is
+       faithful only if every claim is supported by verified evidence.
+    Relevance is a separate short call: say what was asked, then decide whether the answer addresses it.
+    Each stage prompt carries worked examples.
+
+    Returns {"faithfulness", "relevance", "faithfulness_reasoning", "relevance_reasoning", "claims",
+    "checks"}: each metric is "pass", "fail" or "error" (the judge's reply could not be used), "claims"
+    lists each claim with its verdict and evidence, and "checks" holds the deterministic findings.
+    A missing judge model raises JudgeModelNotFound; other model failures propagate to the caller.
+    """
+    checks = judging.precheck(question, answer, context, citations)
+    if checks["abstention"]:
+        return {
+            "faithfulness": "pass", "relevance": "fail",
+            "faithfulness_reasoning": "The answer declines to answer, so it makes no claims to check.",
+            "relevance_reasoning": "The answer declines to answer the question.",
+            "claims": [], "checks": checks,
+        }
+
+    claims_llm, support_llm, relevance_llm = _judge_models(llm)
+
+    claims = []
+    if checks["unverified_numbers"]:
+        # A figure the document never states: faithfulness fails without asking the model.
+        faithfulness = "fail"
+        faithfulness_reasoning = judging.numbers_reasoning(checks["unverified_numbers"])
+    else:
+        try:
+            listed = judging.parse_claims(_ask(claims_llm, judging.build_claims_prompt(answer)), answer)
+            support_prompt = judging.build_support_prompt(context, listed, checks)
+            _require_fits_window(support_prompt)
+            claims = judging.parse_support(_ask(support_llm, support_prompt), listed, context)
+            faithfulness, faithfulness_reasoning = judging.faithfulness_verdict(claims)
+        except judging.JudgeOutputError as error:
+            faithfulness, faithfulness_reasoning = "error", str(error)
+
+    try:
+        relevance, relevance_reasoning = judging.parse_relevance(
+            _ask(relevance_llm, judging.build_relevance_prompt(question, answer)))
+    except judging.JudgeOutputError as error:
+        relevance, relevance_reasoning = "error", str(error)
+
     return {
-        "faithfulness": verdict_from_score(f_eval.get("score")),
-        "relevance": verdict_from_score(r_eval.get("score")),
-        "faithfulness_reasoning": f_eval.get("reasoning"),
-        "relevance_reasoning": r_eval.get("reasoning"),
+        "faithfulness": faithfulness, "relevance": relevance,
+        "faithfulness_reasoning": faithfulness_reasoning, "relevance_reasoning": relevance_reasoning,
+        "claims": claims, "checks": checks,
     }
+
 
 def format_context(docs):
     """Number retrieved chunks by chunk_id so the synthesizer can cite them (AD-5).
@@ -323,7 +363,8 @@ def create_multi_agent_workflow(retriever):
             warnings.warn(warning)
 
         try:
-            result = judge(state["question"], state["answer"], state["context"])
+            result = judge(state["question"], state["answer"], state["context"],
+                           citations=state.get("citations"))
         except JudgeModelNotFound:
             raise  # a setup problem the user must fix; the app shows the message
         except Exception as error:
@@ -337,6 +378,8 @@ def create_multi_agent_workflow(retriever):
         print(f"\n[LANGCHAIN EVALUATOR REASONING]")
         print(f"Faithfulness ({result['faithfulness']}): {result['faithfulness_reasoning']}")
         print(f"Relevance ({result['relevance']}): {result['relevance_reasoning']}\n")
+        if dev_insight.debug_enabled():
+            dev_insight.print_judge_report(result)
 
         # --- THE LANGSMITH OBSERVABILITY PUSH ---
         # The same verdict the UI shows: pass 1, fail 0, error sends nothing.

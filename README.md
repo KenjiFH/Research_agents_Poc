@@ -64,7 +64,12 @@ The graph is a deterministic LangGraph state machine. A model never chooses the 
 * **Hybrid retrieval:** semantic and BM25 results are fused by reciprocal rank, near-duplicates are removed, and a local cross-encoder reranks the candidates. If the reranker cannot load, retrieval keeps its earlier order and prints a warning rather than failing.
 * **Grounded answers:** the answerer replies in a schema-constrained structure with complete sentences and citations. Code, not the model, adds each page number and rejects any quote that is not verbatim text of the chunk it names.
 * **Repeatable results:** random sampling is switched off for both the answering model and the judge, so asking the same question twice gives the same answer and the same Pass / Fail / Error.
-* **Automated QA:** `CriteriaEvalChain` grades *faithfulness* (is the answer supported by the retrieved text?) and *relevance* (does it answer the question?). A judge failure shows as Error, never as a silent fail.
+* **A staged judge:** instead of one big prompt, the judge works in stages, each with worked examples.
+  1. **Quick checks with no model:** an answer that only declines to answer (short, no figures or names, nothing else attached) is recognised directly; an answer that states a number found nowhere in the context or the question fails faithfulness outright; and names found nowhere in the context are flagged as hints.
+  2. **Split the answer into claims,** then **check each claim against the context,** quoting the evidence.
+  3. **Verify the evidence in code:** a claim only counts as supported if its quoted evidence really is text from the context (not a header, not a one-word fragment), and relates to the claim.
+
+  The answer is *faithful* only if every claim is supported, so one invented figure fails an otherwise good answer. A figure the document never states fails even if it could be calculated from it. *Relevance* is a separate step: say what was asked, then decide whether the answer addresses it. A judge reply that cannot be used shows as Error, never as a silent Fail.
 * **Observability:** LangSmith traces node execution and receives the same pass or fail verdicts the interface shows (an Error sends nothing).
 * **Transparency:** a "Retrieved chunks" panel under each answer, and console tools for the developer (below).
 
@@ -73,7 +78,7 @@ The graph is a deterministic LangGraph state machine. A model never chooses the 
 | Area | Tools |
 |---|---|
 | UI | Streamlit |
-| Orchestration | LangGraph, LangChain (`langchain-classic`) |
+| Orchestration | LangGraph, LangChain |
 | Answering model | Ollama, `llama3` by default |
 | Judge model | Ollama, `qwen2.5:14b` by default |
 | Embeddings | Ollama, `nomic-embed-text` |
@@ -133,6 +138,7 @@ RAG_DEBUG=0
 | `RERANKER_MODEL` | The Hugging Face cross-encoder used for reranking |
 | `GATE_ENABLED` | `true` turns on the retry-then-abstain gate on failed faithfulness checks |
 | `MODEL_SEED` | Seed for the answering and judge models. Sampling is switched off (temperature 0), so the same question on the same document gives the same answer and the same grades; change the seed for a different but still repeatable result. Repeatability holds for the same model, hardware and Ollama version |
+| `JUDGE_NUM_CTX` | Context window for the judge (default 8192). The staged judge prompts include examples and the full context, so they can outgrow Ollama's default 4096 |
 | `RAG_DEBUG` | `1` prints chunking reports and per-question retrieval traces to the console |
 
 ## Developer tools
@@ -140,6 +146,7 @@ RAG_DEBUG=0
 Set `RAG_DEBUG=1` before starting the app and the terminal shows:
 
 * a **chunking report** after each upload: counts by type and page, size spread, the biggest chunks (long tables are flagged) and tiny ones;
+* a **judge report** for each answer: the quick-check findings, every claim with its evidence or the reason it was not supported, and the relevance decision;
 * a **retrieval trace** for each question: how many chunks survive each stage, the semantic hits, the BM25 term table with each term's share of every score, the fusion ranks (and which chunks only keyword search found), what de-duplication dropped, how far reranking moved each chunk, and exactly what the answerer receives, with a warning when the context nears the model's window.
 
 To inspect a PDF without the app:
@@ -151,7 +158,7 @@ python3 eval/inspect_retrieval.py path/to/file.pdf "your question" --bm25
 ## Testing and evaluation
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 158 tests; no network or model needed
+python3 -m unittest discover -s tests -t .   # 232 tests; no network or model needed
 python3 eval/retrieval_recall.py             # compares retrieval setups on a synthetic document (needs Ollama)
 python3 eval/answer_compare.py llama3        # compares answer styles on 12 questions (needs Ollama)
 ```
@@ -168,13 +175,14 @@ The two `eval` scripts are small, synthetic checks that show direction, not benc
 | `agents.py` | LangGraph workflow: researcher, synthesizer, evaluator, gate; the shared judge |
 | `document_processor.py` | Docling ingestion, chunking, per-upload store, BM25, fusion, de-duplication, reranking |
 | `session_logic.py` | Pure helpers for the upload lifecycle and for how verdicts, sources and chunks are displayed |
+| `judging.py` | The judge's building blocks: quick deterministic checks, the few-shot prompts and the verification of the judge's replies (no model calls) |
 | `dev_insight.py` | Console output for chunking, BM25 and retrieval insight (imports nothing from the project) |
 | `eval/` | Evaluation and inspection scripts and the example labeled set |
 | `tests/` | The unit and interface tests |
 
 ## Known limitations
 
-* **The judge is not yet validated against human labels.** That is why the gate is off by default. The example labeled set was written by an assistant and needs to be re-labeled by a person from a real document before it counts. Treat the Pass / Fail verdicts as a signal, not ground truth.
+* **The judge is not yet validated against human labels.** The staged design is meant to be more accurate than a single prompt, but that has not been measured against a person's labels. It also makes three model calls per answer instead of two, so grading is slower. That is why the gate is off by default. The example labeled set was written by an assistant and needs to be re-labeled by a person from a real document before it counts. Treat the Pass / Fail verdicts as a signal, not ground truth.
 * **The measurements are small and synthetic.** Check retrieval on your own documents with the retrieved-chunks panel or `RAG_DEBUG`.
 * **LangSmith feedback has been unit-tested but not yet confirmed on a live trace.**
 * **Single document, single user.** Each upload replaces the last, and nothing is persisted.

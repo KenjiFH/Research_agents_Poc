@@ -190,3 +190,32 @@ def print_context_report(context, retrieved_chunks, window_tokens=4096, out=None
         _emit(out, f"   {chunk.get('chunk_id', '?'):>5} p{chunk.get('page_no', '?'):<3} {str(chunk.get('type')):<5} {size:>6} chars")
     if share > 0.75:
         _emit(out, "   WARNING: the context is near the window size, so the model may lose the start of it")
+
+
+# ---------------------------------------------------------------- judge
+
+
+def print_judge_report(result, out=None):
+    """How the judge reached its verdicts: the quick checks, each claim with its evidence, relevance."""
+    _heading(out, "JUDGE")
+    checks = result.get("checks") or {}
+    if checks.get("abstention"):
+        _emit(out, "quick check: the answer declines to answer, so no model was needed")
+    if checks.get("unverified_numbers"):
+        _emit(out, "quick check: numbers in the answer found nowhere in the context: " + ", ".join(checks["unverified_numbers"]))
+    if checks.get("unverified_names"):
+        _emit(out, "quick check: names in the answer found nowhere in the context: " + ", ".join(checks["unverified_names"]))
+    if checks.get("no_verified_citation"):
+        _emit(out, "quick check: the answer has no verified citation")
+    claims = result.get("claims") or []
+    _emit(out, f"faithfulness: {result.get('faithfulness')}  ({len(claims)} claims checked)")
+    for number, claim in enumerate(claims, start=1):
+        mark = "ok " if claim["verdict"] == "supported" else "NO "
+        _emit(out, f"  {mark}{number}. {snippet(claim['claim'], 70)}")
+        if claim["verdict"] == "supported":
+            _emit(out, f"        evidence: {snippet(claim['evidence'], 70)}")
+        else:
+            _emit(out, f"        why: {claim['reason']}")
+    if not claims:
+        _emit(out, f"  {result.get('faithfulness_reasoning')}")
+    _emit(out, f"relevance: {result.get('relevance')}  ({result.get('relevance_reasoning')})")

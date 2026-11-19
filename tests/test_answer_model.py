@@ -73,13 +73,6 @@ class DeterministicSamplingTests(unittest.TestCase):
             self.assertEqual(kwargs["temperature"], 0.0, kwargs)
             self.assertEqual(kwargs["seed"], agents.MODEL_SEED, kwargs)
 
-    def test_the_judge_model_is_deterministic_too(self):
-        with mock.patch.object(agents, "ChatOllama") as chat, mock.patch.object(agents, "load_evaluator") as load:
-            load.return_value.evaluate_strings.return_value = {"score": 1, "reasoning": "r"}
-            agents.judge("q", "a", "c")
-        self.assertEqual(chat.call_args.kwargs["temperature"], 0.0)
-        self.assertEqual(chat.call_args.kwargs["seed"], agents.MODEL_SEED)
-
     def test_no_model_call_in_agents_sets_its_own_temperature(self):
         import inspect
         source = inspect.getsource(agents)

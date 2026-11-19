@@ -41,7 +41,7 @@ The work followed the BMad method, one step at a time:
 - **Measure before and after.** Where a claim could be measured with the local models, a script in
   `eval/` measured it (see below).
 
-The suite grew to 158 tests, all passing. Real Ollama, Chroma, Docling and cross-encoder runs were
+The suite grew to 232 tests, all passing. Real Ollama, Chroma, Docling and cross-encoder runs were
 used for the measurements, but no test depends on a network or a running model.
 
 ## What was built
@@ -184,6 +184,45 @@ A real run on a two-chunk test PDF showed the value straight away: every BM25 te
 because a corpus that small cannot give BM25 anything to rank with, and the report said so instead of
 leaving a silent empty result.
 
+## A staged judge
+
+The first judge asked one model to evaluate everything in a single prompt with a one-sentence rule per
+metric. Three changes made it more reliable:
+
+- **Stages.** The answer is split into claims, each claim is checked against the context with a quoted
+  piece of evidence, and code verifies the quote is real before a claim counts as supported. The answer
+  is faithful only if every claim passes, so one invented figure in an otherwise good answer is caught.
+  Relevance is its own short step (say what was asked, then decide).
+- **Few-shot prompts.** Every stage carries three worked examples on unrelated everyday topics, so the
+  judge learns the rules and not anything about the documents. A test checks the examples hold no
+  domain wording.
+- **Quick deterministic checks.** An answer that only declines to answer needs no model. A number in
+  the answer that appears nowhere in the context or the question fails faithfulness outright, without
+  the model (the context's own page-number headers are stripped first, so a page number is never taken
+  for a stated figure). Names found nowhere in the context become hints for the claim check. An answer
+  with no verified citation is flagged but changes no verdict.
+- **Verifying the judge's own claims.** Evidence a claim quotes must be real document text, at least two
+  words, not a header line, and share a content word or number with the claim. Matching ignores case,
+  smart quotes, markdown and table pipes, and an ellipsis lets a claim quote two sentences.
+
+An independent review of the first version found real holes, all now fixed and covered by tests:
+
+- The abstention shortcut skips the model, so it must be strict. The first rule would have graded
+  "I do not know, but the CEO was fired for fraud" as a pass. It now requires a short answer with no
+  number (spelled out or digits), no name, no continuing word such as "but" or "and", and every
+  sentence a decline.
+- Quoted evidence could be a one-word fragment, a header such as `[c1]`, or any unrelated real sentence.
+- Page numbers in the context headers were counted as numbers the document states.
+- A skipped claim turned a known failure into an Error, which never triggers the gate; a known
+  unsupported claim now outranks an incomplete reply.
+- Claims past the limit were silently dropped; too many claims is now an Error.
+- A prompt larger than the judge window would be silently truncated and wrongly fail claims about the
+  lost text; it is now an Error that says to raise `JUDGE_NUM_CTX`.
+- Text that happened to contain a prompt slot marker could corrupt the prompt.
+
+Costs: three model calls per answer instead of two, and a larger judge context window (8192) because
+the prompts carry examples. The new judge has not yet been measured against human labels.
+
 ## Decisions the user made
 
 - Build the gate before the judge is validated, but keep it **off** by default (`GATE_ENABLED`) until
@@ -236,7 +275,7 @@ leaving a silent empty result.
 ## Reproducing the measurements
 
 ```bash
-python3 -m unittest discover -s tests -t .     # 158 tests, no network or model needed
+python3 -m unittest discover -s tests -t .     # 232 tests, no network or model needed
 python3 eval/retrieval_recall.py               # needs Ollama with nomic-embed-text; first run downloads the reranker
 python3 eval/answer_compare.py llama3          # needs Ollama with llama3 and nomic-embed-text
 ```
